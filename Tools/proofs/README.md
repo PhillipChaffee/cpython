@@ -81,3 +81,49 @@ covered lines. A harness whose final line is unreachable (contradictory assumpti
 fails as vacuous. Each result is written to `Tools/proofs/out/<harness>/result.json`.
 The runner refuses a compile database older than `build/proofs/pyconfig.h` or
 `Makefile`; rerun `build_db.sh` then.
+
+## Reading the report
+
+`python3 Tools/proofs/coverage.py` merges `out/inventory.json` (the denominator)
+with every harness's `out/<harness>/result.json` and `audit.json` and writes, to
+`out/`: `proof-coverage.json`, `proof-coverage-t1.info`, `-t2.info`, `-t3.info`
+(lcov, absolute source paths) and `unreached.md`, then prints a summary.
+
+```sh
+python3 Tools/proofs/coverage.py [--fail-under-t1 PCT] [--baseline FILE] [--file PATH] [--include-unaudited]
+genhtml Tools/proofs/out/proof-coverage-t1.info -o Tools/proofs/out/html   # works without extra flags
+```
+
+- **Tiers.** A line's tier is the highest *audited* tier of any harness that
+  covers it. A T3 line is also a T2 and a T1 line, so T1 >= T2 >= T3. The tier
+  that counts is `audited_tier` from `audit.json`, not the tier declared in
+  `proof.toml`: a harness that declares T2 but whose audit finds no real
+  postcondition counts at T1.
+- **What counts.** Only a harness with status `pass`, an `audit.json` and audit
+  `ok: true`. Anything else contributes nothing and is listed as skipped, with the
+  reason, in the summary. Covered lines outside the inventory are ignored. A line
+  is one distinct (file, line) pair even when the inventory lists it in two
+  functions, so `total_lines` can be a little below the inventory's per-function sum.
+- **Functions.** A function counts for a tier when at least one of its lines is
+  covered at that tier; the summary also gives the number with every line covered.
+- **Not in the denominator.** Files the inventory could not analyse (its
+  `"errors"`) have unknown size and are not in `total_lines`, so every percentage is
+  an upper bound on true coverage. The summary prints their count,
+  `proof-coverage.json` lists them under `not_in_denominator`, and `unreached.md`
+  starts with them as "size unknown, uncovered".
+- **`unreached.md`** lists every function with no covered line as
+  `<path>:<function> — <reason>`. Reasons come from the optional
+  `Tools/proofs/unreached_reasons.toml` (`["<path>"]` tables of function = code,
+  `"*"` for the whole file); the default is `no-harness`. Allowed codes:
+  `no-harness`, `unwind-infeasible`, `platform-ifdef`, `os-behaviour`,
+  `inline-asm`, `solver-timeout`, `needs-contract`. Other codes are an error.
+- **Gates.** `--fail-under-t1 PCT` and `--baseline FILE` (`{"t1": n, "t2": n,
+  "t3": n}` covered-line counts; no tier may drop below it) exit 1 on failure.
+  Exit 2 is a usage or input error.
+- **`--include-unaudited` is provisional.** Until `audit.json` exists, every
+  harness counts for nothing. This flag counts passing, unaudited harnesses at T1
+  only (never higher, whatever they declare) and prints that the figures are
+  provisional and unaudited. It cannot be combined with `--fail-under-t1` or
+  `--baseline`.
+- **`--file PATH`** prints one file's functions with covered/total lines and
+  tier, least covered first.
