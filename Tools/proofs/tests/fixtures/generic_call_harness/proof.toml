@@ -1,0 +1,5 @@
+source = "Python/pyctype.c"
+function = "model_generic_call"
+tier = "T1"
+unwind = 6
+models = ["models", "callee", "object", "errors"]

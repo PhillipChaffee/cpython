@@ -1,0 +1,6 @@
+# The source only supplies core compile flags; the target is the model.
+source = "Python/pyctype.c"
+function = "PyMem_Malloc"
+tier = "T1"
+unwind = 2
+models = ["models", "alloc", "object", "errors"]

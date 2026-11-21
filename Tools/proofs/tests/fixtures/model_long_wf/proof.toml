@@ -1,0 +1,5 @@
+source = "Python/pyctype.c"
+function = "model_nondet_long"
+tier = "T1"
+unwind = 6
+models = ["models", "object"]

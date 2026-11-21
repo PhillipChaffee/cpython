@@ -55,7 +55,11 @@ A harness is a directory `harnesses/<source>/<function>/` with two files:
   static functions are callable), declares the arguments as uninitialised
   locals (any value), narrows them with `__CPROVER_assume()` only as far as the
   callers guarantee, calls the function and states postconditions with
-  `__CPROVER_assert()`. The compile database defines `NDEBUG`, so `assert()`
+  `__CPROVER_assert()`. Control flow in `harness()` that skips the target
+  call on some inputs (an early `return`, a `goto`, or a condition around
+  the call) restricts the inputs exactly like an assume, and the audit does
+  not detect it: reviewers must treat it as one. Harnesses call the target
+  unconditionally. The compile database defines `NDEBUG`, so `assert()`
   checks nothing: the runner reports `error` for a harness that calls
   `assert()`, and for a T2/T3 harness with no `__CPROVER_assert()`. It checks
   all harness code (see "Audit"), not only harness.c. `assumes` in `result.json`
@@ -68,8 +72,11 @@ A harness is a directory `harnesses/<source>/<function>/` with two files:
   tier = "T1"                       # "T1" | "T2" | "T3"
   unwind = 9                        # required for T1/T2; omit for T3
   max_size = 8
-  models = []                       # Tools/proofs/models/<name>.c, linked in; covers <name>.h too
-  contracts = []                    # Tools/proofs/contracts/<name>.c, linked in; covers <name>.h too
+  object_bits = 12                  # optional: cbmc --object-bits (more objects; checks nothing less)
+  models = []                       # Tools/proofs/models/<name>.c (linked in, if it exists) and <name>.h
+  contracts = []                    # Tools/proofs/contracts/<name>.c (linked in, if it exists) and <name>.h
+  # enforce_contract = "v_iadd"     # check the target's contract (see "Contracts")
+  # replace_contracts = ["v_iadd"]  # replace calls by enforced contracts (see "Contracts")
   disable_checks = []               # only "--unsigned-overflow-check", "--conversion-check"
   disable_reason = ""               # required when disable_checks is not empty
   # Audit only (see "Audit"):
@@ -90,8 +97,14 @@ A harness is a directory `harnesses/<source>/<function>/` with two files:
 with the fixed check list, then (on success) `cbmc --cover location` to record the
 covered lines. A harness whose final line is unreachable (contradictory assumptions)
 fails as vacuous. Each result is written to `Tools/proofs/out/<harness>/result.json`.
-The fixed check list includes `--unwinding-assertions` and
-`--no-self-loops-to-assumptions`. Without the second, CBMC turns a loop such as
+The fixed check list includes `--unwinding-assertions`,
+`--no-self-loops-to-assumptions` and `--malloc-may-fail --malloc-fail-null`.
+Without the last two, CBMC's `malloc` never fails and every proof silently
+assumes allocation succeeds; they are passed to every cbmc run (cover runs
+too) and to goto-instrument in contract mode. A harness's own input buffers
+(an argument array the caller already has) are not allocations of the code
+under proof: harnesses write `__CPROVER_assume(buf != NULL)` after such a
+`malloc`, and the assume is listed like any other. Without the second, CBMC turns a loop such as
 `for (;;);` into an assumption that no listing shows; with it, such a loop
 fails its unwinding assertion. Every gcc, goto-cc and cbmc subprocess of the
 runner and the audit gets the caller's environment without `CPATH`,
@@ -216,13 +229,17 @@ its `input_hash` matches; otherwise it runs the harness again first.
    that file with no assume at all (`#define if(x) ...`, or a redefined
    CPython macro). It makes `ok` false, naming the macro, unless proof.toml
    lists the name in `predefine`, with a `predefine_reason`. The audit follows
-   `#include` into harness code and into model and contract headers, so a
-   macro defined in such a header counts. Conditionals are not evaluated: a
+   `#include "..."` and `#include <...>` into harness code and into model and
+   contract headers, resolving them as gcc does (the including file's
+   directory for `"..."`, then the `-I` directories, then the system ones), so
+   a macro defined in such a header counts. `#import` and `#include_next` are
+   refused anywhere in harness code (`ok` false, naming the line): neither is
+   followed. Conditionals are not evaluated: a
    directive in a skipped `#if` branch counts too. `#pragma` (except `once`)
    and `_Pragma` in that region are always refused. A harness header that is
    included before the source should use `#pragma once`, not a `#define`
    include guard. An unused `predefine` entry is reported as a note.
-4. **Mutation (T2; T3 once contract mode exists).** universalmutator (`mutate --noCheck --lines`)
+4. **Mutation (T2; T3 once T3 mode exists).** universalmutator (`mutate --noCheck --lines`)
    mutates only the target function's lines, as CBMC's source locations give
    them. Each mutant is a full copy of the source file in a temporary tree with
    the same repo-relative path. The harness is compiled with that tree first on
@@ -247,7 +264,7 @@ its `input_hash` matches; otherwise it runs the harness again first.
 
    An entry that matches no mutant in the sample is listed in the verdict's
    `unused_equivalents` (a note, not a problem), so a stale offset is visible.
-   Below T2, and for T3 until contract mode exists, no mutants are sampled, so
+   Below T2, and for T3 until T3 mode exists, no mutants are sampled, so
    every entry is listed there.
    A target guarded by `abort()` or `Py_FatalError()` may be capped at T1. A
    mutant that makes the guard fire on every input is vacuous, and a vacuous
@@ -257,9 +274,69 @@ its `input_hash` matches; otherwise it runs the harness again first.
    harness's preconditions. A mutant that differs only for inputs beyond the
    proof bound is not equivalent: it is a limit of the bound. `--fail-fast`
    stops at the first mutant that is not killed.
-5. **T3.** T3 needs no `unwind` and a contract-mode run (`goto-instrument --dfcc
-   harness --enforce-contract <function> --apply-loop-contracts`). The runner has
-   no contract mode yet, so every T3 harness is demoted to T1 for now.
+5. **T3.** T3 needs no `unwind` and a contract-mode run with loop contracts
+   (`--apply-loop-contracts`, Task 7). The runner enforces function contracts
+   (see "Contracts") but has no unbounded mode yet, so every T3 harness is
+   demoted to T1 for now.
+
+## Models
+
+`models/` holds sound over-approximations of CPython runtime functions that
+harnesses link instead of the real ones. Each function's contract is the
+comment above it. List each file used in proof.toml `models`; `models.h`
+(the entry `"models"`) declares them. Include it after the source.
+
+| File | Provides | Narrower than the real function |
+| --- | --- | --- |
+| `alloc.c` | `PyMem_*`, `PyMem_Raw*`, `PyObject_*` Malloc/Calloc/Realloc/Free, `_PyObject_GC_New`, `_PyObject_GC_NewVar`, `PyObject_GC_Del` | Every allocator can return NULL on any call. Blocks are exact-size, except `PyObject_*` requests under 32 bytes, which get 32 (pymalloc's size class): CBMC checks `z->long_value` against the whole member, and a 0- or 1-digit int requests 28 bytes. A read in [n, 32) of such a block is not reported. |
+| `object.c` | `model_nondet_long/bytes/unicode/object()`, `_Py_NewReference` | Never NULL (an existing object). Ints: real layout, normalised, digits <= `PyLong_MASK`, at least `sizeof(PyLongObject)` bytes. Str: compact ASCII only (compact non-ASCII and legacy strings are not modelled). Objects: int, bytes, str, or a type with no slots. |
+| `errors.c` | `model_current_exception`, `model_error_is_set()`, `PyErr_SetString`/`SetObject`/`Format`/`NoMemory`/`Occurred`/`Clear`, `_PyErr_SetString`, `_PyErr_BadInternalCall`, the `PyExc_*` types they raise | Starts with no error set. Exception values and tracebacks are not modelled. |
+| `callee.c` | `model_generic_call()` | NULL with the error set, or a new reference to a `model_nondet_object()`. Side effects of the real callee on global state are not modelled. |
+| `runtime.c` | `_PyRuntime` (real small-int table, other fields zero), `_Py_tss_tstate`, `_Py_tss_interp`, `model_init_runtime()` | Fields other than the small ints, the reference tracer (off) and the int free list hold their zero value; a harness whose target reads another one sets it itself. |
+
+A pointer into `_PyRuntime` (a small int) read through a pointer whose
+possible targets include that 251 KB object makes CBMC extract bytes at a
+symbolic offset of it, which runs out of memory. Branch on
+`__CPROVER_same_object(p, _PyLong_SMALL_INTS)` directly on that pointer
+(CBMC then drops `_PyRuntime` from its targets in the other branch) and read
+a small int by index.
+
+## Contracts
+
+`contracts/<file>.h` attaches CBMC contracts (`__CPROVER_requires`,
+`__CPROVER_ensures`, `__CPROVER_assigns`) to functions of `<file>` without
+editing it: a redeclaration of the function with the clauses, included after
+the source. Attaching works for static functions too.
+
+- `enforce_contract = "f"` (f must be the target) runs `goto-cc --function
+  harness` (relink), `goto-instrument --drop-unused-functions` (`--dfcc`
+  stops on the `__atomic_*` library's call to `__CPROVER_fence`, which has
+  no body), then `goto-instrument --dfcc harness --malloc-may-fail
+  --malloc-fail-null --enforce-contract f`: requires are assumed, ensures
+  and assigns checked. The mutation gate and coverage work as usual.
+- `replace_contracts = ["g", ...]` uses `--replace-call-with-contract g`:
+  each call's requires are checked, its assigns havocked, its ensures
+  assumed (listed in `assumes`).
+- A function named in either without contract clauses is an error:
+  goto-instrument would otherwise derive an empty contract (assigns nothing,
+  ensures true).
+- Contract clauses in harness code or a model are refused: a harness could
+  otherwise replace a call by a contract that nothing enforces.
+- **No orphan contracts.** A `replace_contracts` entry g needs an enforcing
+  harness (`enforce_contract = "g"`) whose `audit.json` is `ok`, current
+  (its `input_hash` equals `run.input_hash()` of it now), and records in
+  `contract_hashes` the current sha256 of every listed contract file that
+  declares g's clauses. `audit.py` audits enforcing harnesses first.
+- Facts of CBMC 5.95.1 found while building this: `goto-instrument --dfcc`
+  needs an entry point (`goto-cc --function harness`); goto-instrument links
+  CBMC's library, so `--malloc-may-fail` given only to cbmc has no effect
+  on a `--dfcc` binary; an assumed `__CPROVER_forall` whose range is
+  symbolic (`i < m`) is silently not assumed (asserted ones fail), so every
+  quantifier needs a constant bound (`i < 3 && i < m`); goto-cc refuses a
+  second contract for the same function ("contract already set").
+- Cost: enforcing the `v_iadd` contract at 3 digits took about 3 to 6
+  minutes against about 2 minutes for the plain proof at 4 digits
+  (`pilot-report.md`).
 
 ## Reading the report
 

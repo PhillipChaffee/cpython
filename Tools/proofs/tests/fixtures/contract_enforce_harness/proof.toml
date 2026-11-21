@@ -1,0 +1,6 @@
+source = "Tools/proofs/tests/fixtures/contract_src.c"
+function = "add_into"
+tier = "T1"
+unwind = 2
+contracts = ["add_into"]
+enforce_contract = "add_into"

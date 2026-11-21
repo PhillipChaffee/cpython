@@ -1,0 +1,5 @@
+source = "Tools/proofs/tests/fixtures/loop.c"
+function = "sum"
+tier = "T1"
+unwind = 5
+max_size = 4

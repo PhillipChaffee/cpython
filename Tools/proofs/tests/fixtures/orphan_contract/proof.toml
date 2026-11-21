@@ -1,0 +1,6 @@
+source = "Tools/proofs/tests/fixtures/contract_src.c"
+function = "sub_three"
+tier = "T1"
+unwind = 2
+contracts = ["orphan"]
+replace_contracts = ["sub_from"]
