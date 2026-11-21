@@ -47,6 +47,32 @@ What this changes in the tasks:
 - **Task 3:** CBMC checks properties across the whole translation unit (7,420 here), and unreachable ones pass trivially. The runner must report only properties in functions the harness reaches. Roughly 30 s per harness on a large file means the full campaign needs parallel runs; `--drop-unused-functions` did not reduce the time in this spike.
 - **Not yet tested:** function and loop contracts (Task 7), models for heap objects (Task 6), `bear`, `universalmutator`, GenMC, TLC.
 
+## Scope coverage of this plan (tool-checked)
+
+`docs/superpowers/plans/2026-11-21-cpython-proof-coverage-scope.py` assigns every tracked `.c` and `.h` file to a Task 10 wave or a named exclusion and exits non-zero if any file is left over. Its rule list is the authoritative file-to-wave mapping; where it and the wave table in Task 10 differ, the script wins. Result on this tree: all 1,156 files assigned, none unassigned.
+
+| Bucket | Files | Lines |
+| --- | --- | --- |
+| Wave 1: pure leaves | 30 | 11,661 |
+| Wave 2: value objects | 9 | 21,873 |
+| Wave 3: containers and text | 7 | 43,579 |
+| Wave 4: front end | 29 | 49,735 |
+| Wave 5: compiler | 11 | 35,931 |
+| Wave 6: interpreter core | 20 | 83,872 |
+| Wave 7: object model and memory | 13 | 37,937 |
+| Wave 8: runtime, remaining `Python/`, `Objects/`, `Programs/` | 139 | 112,007 |
+| Wave 9: extension modules | 301 | 447,241 |
+| Headers in `Include/`, proved through the harnesses that include them | 289 | 58,926 |
+| **In proof scope** | **848** | **902,762 (85.0%)** |
+| Excluded: `Modules/_hacl/`, verified upstream in F* | 47 | 22,319 |
+| Excluded: vendored third-party | 63 | 39,018 |
+| Excluded: other platforms | 50 | 17,632 |
+| Excluded: JIT machine-code emission | 10 | 3,167 |
+| Excluded: test, demo and example code | 137 | 76,544 |
+| Excluded: build configuration probes | 1 | 316 |
+
+These are raw file lines, not executable lines, and this shows what the plan targets, not what has been proved. The excluded 15% is not CPython functionality on the in-scope platform, apart from the JIT emitter and the vendored libraries, which are named so the gap is explicit.
+
 ## Global Constraints
 
 - Proofs run on unmodified sources. No edits to any file outside `Tools/proofs/`, `docs/superpowers/`, and `.github/workflows/proofs.yml`.
