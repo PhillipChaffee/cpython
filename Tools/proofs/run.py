@@ -365,13 +365,18 @@ def _run(hdir, result, compile_db, include_first=(), timeout=TIMEOUT):
     model_srcs = [MODELS / f"{n}.c" for n in cfg.get("models", [])]
     result.assumes = _count_assumes([harness_c, *model_srcs])
 
+    # A run against substituted sources (include_first) is not a run of the
+    # harness's recorded inputs, so it carries no input hash.  Otherwise the
+    # hash is taken before and after compiling, and recorded only if the two
+    # agree: the binary was then built from exactly the hashed inputs.
+    before = None if include_first else input_hash(hdir, compile_db=compile_db)
     with tempfile.TemporaryDirectory() as tmp:
         goto = os.path.join(tmp, "harness.goto")
         cwd, root = compile_harness(hdir, cfg, goto, compile_db, include_first, timeout)
-        # A run against substituted sources (include_first) is not a run of the
-        # harness's recorded inputs, so it carries no input hash.
-        if not include_first:
-            result.input_hash = input_hash(hdir, compile_db=compile_db)
+        if before is not None:
+            if input_hash(hdir, compile_db=compile_db) != before:
+                raise HarnessError("inputs changed during run")
+            result.input_hash = before
 
         base = cbmc_base(goto, cfg)
         result.cbmc_flags = [*base[4:], *checks(cfg)]

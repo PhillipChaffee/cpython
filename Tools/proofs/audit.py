@@ -52,6 +52,8 @@ class Verdict:
     mutants_killed: int = 0
     mutants_vacuous: int = 0        # mutant proof "failed" only as vacuous: not killed
     mutants_error: int = 0          # mutant proof errored or timed out: not killed
+    unused_equivalents: list = dataclasses.field(default_factory=list)
+    """equivalent_mutants entries that match no sampled mutant (a note, not a problem)."""
     input_hash: str = ""
 
     def to_json(self):
@@ -84,12 +86,43 @@ def assume_texts(path, label):
     return out
 
 
-def assert_lines(harness_c):
-    """Line numbers of harness.c holding a literal __CPROVER_assert call (not
+def assert_lines(path):
+    """Line numbers of ``path`` holding a literal __CPROVER_assert call (not
     #define lines).  Only a cross-check: reachability is decided per goal."""
-    lines = _strip_comments(pathlib.Path(harness_c).read_text(errors="replace")).splitlines()
+    lines = _strip_comments(pathlib.Path(path).read_text(errors="replace")).splitlines()
     return [n for n, l in enumerate(lines, 1)
             if re.search(r"__CPROVER_assert\s*\(", l) and not l.lstrip().startswith("#")]
+
+
+# -- harness code ------------------------------------------------------------
+
+def _in_dir(path, hdir):
+    return os.path.realpath(path).startswith(os.path.realpath(hdir) + os.sep)
+
+
+def harness_files(hdir, cfg, compile_db=None):
+    """Harness code: harness.c and every file it includes from the harness
+    directory (``goto-cc -M`` with the run's flags), as sorted real paths."""
+    cmd, cwd, _ = run.goto_cc_command(hdir, cfg, run.GOTO_PLACEHOLDER, compile_db)
+    files = {os.path.realpath(hdir / "harness.c")}
+    files |= {f for f in run._dependencies(cmd, cwd) if _in_dir(f, hdir)}
+    return sorted(files)
+
+
+_LINE_DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*(?:line\b|\d)", re.M)
+
+
+def line_directives(files, hdir):
+    """Problems for #line directives (and GNU '# N' markers) in harness code:
+    they relocate goals, so assertions could hide from the reachability check."""
+    out = []
+    for f in files:
+        code = _strip_comments(pathlib.Path(f).read_text(errors="replace"))
+        for m in _LINE_DIRECTIVE.finditer(code):
+            line = code.count("\n", 0, m.start()) + 1
+            out.append(f"{os.path.relpath(f, hdir)}:{line}: #line directives are not "
+                       "allowed in harness code")
+    return out
 
 
 # -- rule 1 ------------------------------------------------------------------
@@ -169,11 +202,11 @@ def reachable_from(functions, start):
     return seen
 
 
-def harness_stubs(functions, harness_c, target):
-    """Functions defined in harness.c, other than harness(), that the target can reach."""
-    harness_c = os.path.realpath(harness_c)
+def harness_stubs(functions, hdir, target):
+    """Functions defined in harness code (any file in the harness directory),
+    other than harness(), that the target can reach."""
     defined = {n for n, f in functions.items()
-               if n != run.ENTRY and any(path == harness_c for path, _ in f.locs)}
+               if n != run.ENTRY and any(_in_dir(path, hdir) for path, _ in f.locs)}
     return sorted(defined & reachable_from(functions, target))
 
 
@@ -211,7 +244,7 @@ def check_stub_files(cfg, files):
     return listed, problems
 
 
-def reachability(goto, cfg, cwd, harness_c, candidates):
+def reachability(goto, cfg, cwd, hdir, files, candidates):
     """(unreachable assertion problems, reached body-less functions).
 
     Body-less candidates get a generated ``assert(false)`` body, then ``cbmc
@@ -229,7 +262,6 @@ def reachability(goto, cfg, cwd, harness_c, candidates):
     goals = next((m["goals"] for m in json.loads(out) if "goals" in m), None)
     if goals is None:
         raise AuditError("cbmc --cover assertion printed no goals")
-    harness_c = os.path.realpath(harness_c)
     goal_lines, unreachable, reached = set(), [], set()
     for g in goals:
         loc = g.get("sourceLocation", {})
@@ -239,19 +271,21 @@ def reachability(goto, cfg, cwd, harness_c, candidates):
                 reached.add(loc["function"])
             continue
         path = os.path.realpath(os.path.join(loc.get("workingDirectory", cwd), loc.get("file", "")))
-        if path != harness_c or "line" not in loc:
+        if not _in_dir(path, hdir) or "line" not in loc:
             continue
-        # Every assertion located in harness.c must be reachable, however it
-        # was written (directly, through a macro, in a helper function).
-        goal_lines.add(int(loc["line"]))
+        # Every assertion located in harness code must be reachable, however
+        # it was written (directly, through a macro, in a helper or header).
+        rel = os.path.relpath(path, os.path.realpath(hdir))
+        goal_lines.add((path, int(loc["line"])))
         if not sat:
-            msg = (f"harness.c:{loc['line']}: assertion is unreachable (vacuous): "
-                   f"{g.get('description', '')}")
-            if msg not in unreachable:
-                unreachable.append(msg)
-    problems = sorted(unreachable, key=lambda m: int(m.split(":")[1]))
-    problems += [f"harness.c:{line}: __CPROVER_assert has no assertion goal"
-                 for line in assert_lines(harness_c) if line not in goal_lines]
+            key = (rel, int(loc["line"]), g.get("description", ""))
+            if key not in unreachable:
+                unreachable.append(key)
+    problems = [f"{rel}:{line}: assertion is unreachable (vacuous): {desc}"
+                for rel, line, desc in sorted(unreachable)]
+    problems += [f"{os.path.relpath(f, os.path.realpath(hdir))}:{line}: "
+                 "__CPROVER_assert has no assertion goal"
+                 for f in files for line in assert_lines(f) if (f, line) not in goal_lines]
     return problems, sorted(reached)
 
 
@@ -385,7 +419,7 @@ def _equivalents(cfg):
     out = {}
     for e in cfg.get("equivalent_mutants", []):
         if (not isinstance(e, dict) or not isinstance(e.get("offset"), int)
-                or not e.get("diff") or not str(e.get("reason", "")).strip()):
+                or isinstance(e.get("offset"), bool) or not e.get("diff") or not str(e.get("reason", "")).strip()):
             raise AuditError("proof.toml: equivalent_mutants entries need 'offset' (int), "
                              "'diff' and 'reason'")
         out[(e["offset"], " ".join(e["diff"].split()))] = e["reason"]
@@ -407,6 +441,7 @@ class Gate:
     error: int = 0
     problems: list = dataclasses.field(default_factory=list)
     demote: bool = False
+    unused_equivalents: list = dataclasses.field(default_factory=list)
 
 
 def mutation_gate(hdir, cfg, goto_fns, baseline_seconds, jobs, fail_fast, compile_db=None):
@@ -432,6 +467,8 @@ def mutation_gate(hdir, cfg, goto_fns, baseline_seconds, jobs, fail_fast, compil
         tmp = pathlib.Path(tmp)
         check_substitution(hdir, cfg, source, tmp, compile_db)
         selected, _ = select_mutants(hdir, cfg, source, mutants, limit, tmp, jobs, compile_db)
+        sampled = {(m.line - first, " ".join(m.diff.split())) for m, _ in selected}
+        gate.unused_equivalents = [f"offset {o}: {d}" for o, d in equivalent if (o, d) not in sampled]
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
             futs = {pool.submit(run.run_harness, hdir, tmp / f"out{n}", compile_db, dirs, timeout): m
                     for n, (m, dirs) in enumerate(selected)}
@@ -505,7 +542,6 @@ def audit(hdir, out=OUT, jobs=None, fail_fast=False, compile_db=None):
 def _audit(hdir, v, out, jobs, fail_fast, compile_db):
     cfg = run._read_config(hdir)           # rule 1: disable_checks needs disable_reason
     tier = cfg["tier"]
-    harness_c = hdir / "harness.c"
     v.input_hash = run.input_hash(hdir, compile_db=compile_db)
     result = _current_result(hdir, out, v.input_hash, compile_db)
     if result.input_hash != v.input_hash:
@@ -514,7 +550,9 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
         raise AuditError(f"proof did not pass ({result.status}): {result.detail}")
 
     fatal = check_flags(cfg, result)                                    # rule 1
-    v.assumes = assume_texts(harness_c, "harness.c")
+    files = harness_files(hdir, cfg, compile_db)
+    fatal += line_directives(files, hdir)                               # rule 2
+    v.assumes = [a for f in files for a in assume_texts(f, os.path.relpath(f, hdir))]
     for n in cfg.get("models", []):
         v.assumes += assume_texts(run.MODELS / f"{n}.c", f"models/{n}.c")
 
@@ -535,7 +573,7 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
         v.stubs, stub_problems = check_stub_files(cfg, symbol_files(goto, cwd))   # rule 3
         fatal += stub_problems
         fns = goto_functions(goto, cwd)
-        unreachable, reached = reachability(goto, cfg, cwd, harness_c, bodyless(goto, cwd, fns))  # rule 2
+        unreachable, reached = reachability(goto, cfg, cwd, hdir, files, bodyless(goto, cwd, fns))  # rule 2
     fatal += unreachable
     unlisted = [f for f in reached if f not in havoc]
     if unlisted:
@@ -543,10 +581,10 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
                      + ", ".join(unlisted) + "; add a model or list them in havoc_callees")
     v.stubs += [f"havoc:{h}" for h in havoc]
     notes = [f"havoc_callees entry {h!r} is not reached" for h in havoc if h not in reached]
-    defined = harness_stubs(fns, harness_c, cfg["function"])
+    defined = harness_stubs(fns, hdir, cfg["function"])
     unlisted = [f for f in defined if f not in hstubs]
     if unlisted:
-        fatal.append(f"{cfg['function']} can reach functions defined in harness.c: "
+        fatal.append(f"{cfg['function']} can reach functions defined in harness code: "
                      + ", ".join(unlisted) + "; list them in harness_stubs")
     v.stubs += [f"harness:{h}" for h in hstubs]
     notes += [f"harness_stubs entry {h!r} is not reachable from {cfg['function']}"
@@ -570,6 +608,7 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
         gate = mutation_gate(hdir, cfg, fns, result.seconds, jobs, fail_fast, compile_db)
         v.mutants_total, v.mutants_killed = gate.total, gate.killed
         v.mutants_vacuous, v.mutants_error = gate.vacuous, gate.error
+        v.unused_equivalents = gate.unused_equivalents
         v.problems += gate.problems
         if gate.demote:
             v.audited_tier = "T1"

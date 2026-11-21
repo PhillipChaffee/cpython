@@ -139,6 +139,22 @@ class RunFixtureTest(unittest.TestCase):
         self.assertEqual(r.status, "fail", r.detail)
         self.assertEqual(r.input_hash, "")        # not a run of the recorded inputs
 
+    def test_inputs_changed_during_run_is_an_error(self):
+        real = run.compile_harness
+        with tempfile.TemporaryDirectory() as tmp:
+            h = pathlib.Path(tmp) / "h"
+            shutil.copytree(FIX / "loop_harness_ok", h)
+
+            def edit_while_compiling(*args, **kwargs):
+                out = real(*args, **kwargs)
+                (h / "harness.c").write_text((h / "harness.c").read_text() + "/* edit */\n")
+                return out
+            with unittest.mock.patch.object(run, "compile_harness", edit_while_compiling):
+                r = run.run_harness(h, out=pathlib.Path(tmp) / "out")
+        self.assertEqual(r.status, "error")
+        self.assertIn("inputs changed during run", r.detail)
+        self.assertEqual(r.input_hash, "")
+
     def test_disable_checks_outside_list_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             h = pathlib.Path(tmp) / "h"

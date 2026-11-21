@@ -96,7 +96,7 @@ per harness, whether a passing proof can be trusted and which tier it has earned
 It writes `Tools/proofs/out/<harness>/audit.json` with `ok`, `audited_tier`,
 `problems`, `stubs`, `assumes` (the text of every `__CPROVER_assume`, with its
 file and line), `mutants_total`, `mutants_killed`, `mutants_vacuous`,
-`mutants_error` and `input_hash`, prints one
+`mutants_error`, `unused_equivalents` and `input_hash`, prints one
 line per harness and exits 1 if any harness is not `ok`. When `ok` is false the
 harness counts for nothing. When `ok` is true, `audited_tier` is the declared
 tier, or T1 if rule 4 or 5 is not met; such a demotion is listed in `problems`
@@ -108,19 +108,25 @@ every file inside the repository that goto-cc reads for the harness, as
 source, every included file such as `Python/pyctype.c`, the headers and
 `build/proofs/pyconfig.h`, and the listed models and contracts. It also hashes
 the exact goto-cc and cbmc argument lists and `cbmc --version`. System headers
-outside the repository are not hashed. The audit reuses `result.json` only if
+outside the repository are not hashed. The runner hashes the inputs before and
+after compiling, and records the hash only if the two agree. Otherwise the run
+is an error ("inputs changed during run"). The audit reuses `result.json` only if
 its `input_hash` matches; otherwise it runs the harness again first.
 
 1. **Checks.** The property run used `--unwinding-assertions`, an `--unwind`
    bound (below T3) and every check of the fixed list, except checks disabled
    with a non-empty `disable_reason`. The audit reads the flags the run recorded
    in `result.json` (`cbmc_flags`).
-2. **Not vacuous.** The end of `harness()` must be reachable (the runner's
-   guard), and so must every assertion located in harness.c, however it is
-   written (directly, through a macro, or in a helper function). The audit
+2. **Not vacuous.** *Harness code* is every file in the harness directory:
+   harness.c and any header or `.c` file it includes from that directory. The
+   end of `harness()` must be reachable (the runner's guard). Every assertion
+   located in harness code must also be reachable, however it is written
+   (directly, through a macro, in a helper function or in a header). `#line`
+   directives in harness code are rejected, because they move goals to
+   other files. The audit
    checks the second with `cbmc --cover assertion`: an assertion goal that
    cannot be satisfied is an assertion that no input reaches. As a cross-check,
-   each literal `__CPROVER_assert(` line must have a goal.
+   each literal `__CPROVER_assert(` line in harness code must have a goal.
 3. **Stubs.** Every file under `models/` or `contracts/` that is compiled in
    (found from the goto binary's symbol table) must be listed in proof.toml.
    Every function that the proof reaches but that has no body, even after CBMC
@@ -132,7 +138,7 @@ its `input_hash` matches; otherwise it runs the harness again first.
    each body-less function an `assert(false)` body (`goto-instrument
    --generate-function-body ... assert-false`) and asks `cbmc --cover assertion`
    which of those assertions can be reached. So a call on an infeasible path does
-   not count. A function defined in harness.c (other than `harness()`) that the
+   not count. A function defined in harness code (other than `harness()`) that the
    target function can call, directly or through other functions, is a stub
    too. It must be listed in `harness_stubs`, with a `harness_stubs_reason`.
    Helpers that only `harness()` calls are not stubs. `stubs` lists
@@ -160,6 +166,12 @@ its `input_hash` matches; otherwise it runs the harness again first.
    diff = "if (len == 0) ==> if (len <= 0)"
    reason = "len >= 0, so len <= 0 is len == 0"
    ```
+
+   An entry that matches no mutant in the sample is listed in the verdict's
+   `unused_equivalents` (a note, not a problem), so a stale offset is visible.
+   A target guarded by `abort()` or `Py_FatalError()` may be capped at T1. A
+   mutant that makes the guard fire on every input is vacuous, and a vacuous
+   mutant counts as not killed.
 
    List a mutant only if it changes nothing a caller can observe under the
    harness's preconditions. A mutant that differs only for inputs beyond the

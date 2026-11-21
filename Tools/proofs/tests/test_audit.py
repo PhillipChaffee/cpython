@@ -124,6 +124,40 @@ class AuditFixtureTest(unittest.TestCase):
         self.assertEqual([p for p in v.problems if "unreachable" in p],
                          ["harness.c:15: assertion is unreachable (vacuous): s == 12345"])
 
+    def test_unreachable_assertion_in_harness_header_is_rejected(self):
+        v = audit.audit(FIX / "header_assert_harness")
+        self.assertFalse(v.ok)
+        self.assertEqual([p for p in v.problems if "unreachable" in p],
+                         ["check.h:5: assertion is unreachable (vacuous): dead code in check.h"])
+
+    def test_line_directive_in_harness_code_is_rejected(self):
+        v = audit.audit(FIX / "line_directive_harness")
+        self.assertFalse(v.ok)
+        self.assertIn("harness.c:11: #line directives are not allowed in harness code", v.problems)
+
+    def test_stub_in_harness_header_is_an_unlisted_stub(self):
+        v = audit.audit(FIX / "header_stub_harness")
+        self.assertFalse(v.ok)
+        self.assertIn("provider", " ".join(v.problems))
+        listed = lambda t: t + 'harness_stubs = ["provider"]\nharness_stubs_reason = "test"\n'
+        v = self.audit_copy(FIX / "header_stub_harness", edit_toml=listed)
+        self.assertTrue(v.ok, v.problems)
+        self.assertEqual(v.stubs, ["harness:provider"])
+
+    def test_bool_offset_is_rejected(self):
+        cfg = {"equivalent_mutants": [{"offset": True, "diff": "a ==> b", "reason": "r"}]}
+        with self.assertRaises(audit.AuditError):
+            audit._equivalents(cfg)
+
+    def test_unused_equivalent_is_reported_as_a_note(self):
+        stale = ('\n[[equivalent_mutants]]\noffset = 99\ndiff = "if (s < 0) ==> if (s <= 0)"\n'
+                 'reason = "stale offset"\n')
+        v = self.audit_copy(FIX / "strong_harness", edit_toml=lambda t: t + stale)
+        self.assertTrue(v.ok, v.problems)
+        self.assertEqual(v.audited_tier, "T2", v.problems)
+        self.assertEqual(v.unused_equivalents, ["offset 99: if (s < 0) ==> if (s <= 0)"])
+        self.assertEqual(audit.audit(FIX / "strong_harness").unused_equivalents, [])
+
     def test_harness_defined_callee_is_an_unlisted_stub(self):
         v = audit.audit(FIX / "callback_harness")
         self.assertFalse(v.ok)

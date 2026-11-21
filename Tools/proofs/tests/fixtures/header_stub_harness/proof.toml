@@ -1,0 +1,9 @@
+source = "Tools/proofs/tests/fixtures/callback.c"
+function = "use_provider"
+tier = "T1"
+unwind = 1
+max_size = 4
+models = []
+contracts = []
+disable_checks = []
+disable_reason = ""
