@@ -97,16 +97,42 @@ def assert_lines(path):
 # -- harness code ------------------------------------------------------------
 
 def _in_dir(path, hdir):
-    return os.path.realpath(path).startswith(os.path.realpath(hdir) + os.sep)
+    return run.inside(path, hdir)
 
 
-def harness_files(hdir, cfg, compile_db=None):
-    """Harness code: harness.c and every file it includes from the harness
-    directory (``goto-cc -M`` with the run's flags), as sorted real paths."""
+harness_files = run.harness_files
+
+
+def foreign_includes(hdir, cfg, compile_db=None):
+    """Problems for files the harness's compilation reads that no rule governs.
+
+    Allowed: harness code (real path inside the harness directory), models and
+    contracts (rule 3), repository files outside Tools/proofs/ and files outside
+    the repository.  For a fixture source under tests/fixtures/, that source and
+    the files directly beside it are allowed too.  Anything else under
+    Tools/proofs/ (another harness, a shared helper) is refused, as is a symlink
+    in the harness directory whose target lies outside it.
+    """
     cmd, cwd, _ = run.goto_cc_command(hdir, cfg, run.GOTO_PLACEHOLDER, compile_db)
-    files = {os.path.realpath(hdir / "harness.c")}
-    files |= {f for f in run._dependencies(cmd, cwd) if _in_dir(f, hdir)}
-    return sorted(files)
+    hdir_s = str(hdir) + os.sep
+    source = os.path.realpath(ROOT / cfg["source"])
+    fixture_source = run.inside(source, HERE / "tests" / "fixtures")
+    problems = []
+    for raw in sorted(run._dependencies(cmd, cwd, resolve=False)):
+        real = os.path.realpath(raw)
+        if run.inside(real, hdir):
+            continue
+        if raw.startswith(hdir_s):
+            problems.append(f"{os.path.relpath(raw, hdir)} is a symlink to {real}, outside "
+                            "the harness directory; copy the helper in instead")
+        elif run.inside(real, run.MODELS) or run.inside(real, run.CONTRACTS):
+            continue
+        elif run.inside(real, HERE):
+            if fixture_source and os.path.dirname(real) == os.path.dirname(source):
+                continue
+            problems.append(f"includes {os.path.relpath(real, ROOT)}, proof code outside "
+                            "the harness directory that no audit rule checks")
+    return problems
 
 
 _LINE_DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*(?:line\b|\d)", re.M)
@@ -426,6 +452,10 @@ def _equivalents(cfg):
     return out
 
 
+def _describe(keys):
+    return [f"offset {o}: {d}" for o, d in keys]
+
+
 def classify(result):
     """killed | vacuous | error | pass, for one mutant's run.Result."""
     if result.status == "fail":
@@ -452,6 +482,8 @@ def mutation_gate(hdir, cfg, goto_fns, baseline_seconds, jobs, fail_fast, compil
     Vacuous, errored and timed-out mutants are never excused.
     """
     gate = Gate()
+    equivalent = _equivalents(cfg)
+    gate.unused_equivalents = _describe(equivalent)       # until a sample matches them
     source = (ROOT / cfg["source"]).resolve()
     lines = function_lines(goto_fns, cfg["function"], source)
     if not lines:
@@ -459,7 +491,6 @@ def mutation_gate(hdir, cfg, goto_fns, baseline_seconds, jobs, fail_fast, compil
         gate.demote = True
         return gate
     first = lines[0]
-    equivalent = _equivalents(cfg)
     limit = int(cfg.get("mutants_max", MUTANTS_MAX))
     timeout = max(3 * baseline_seconds, MIN_MUTANT_TIMEOUT)
     mutants = order_mutants(generate_mutants(source, set(lines)))
@@ -468,7 +499,7 @@ def mutation_gate(hdir, cfg, goto_fns, baseline_seconds, jobs, fail_fast, compil
         check_substitution(hdir, cfg, source, tmp, compile_db)
         selected, _ = select_mutants(hdir, cfg, source, mutants, limit, tmp, jobs, compile_db)
         sampled = {(m.line - first, " ".join(m.diff.split())) for m, _ in selected}
-        gate.unused_equivalents = [f"offset {o}: {d}" for o, d in equivalent if (o, d) not in sampled]
+        gate.unused_equivalents = _describe(k for k in equivalent if k not in sampled)
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
             futs = {pool.submit(run.run_harness, hdir, tmp / f"out{n}", compile_db, dirs, timeout): m
                     for n, (m, dirs) in enumerate(selected)}
@@ -552,6 +583,7 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
     fatal = check_flags(cfg, result)                                    # rule 1
     files = harness_files(hdir, cfg, compile_db)
     fatal += line_directives(files, hdir)                               # rule 2
+    fatal += foreign_includes(hdir, cfg, compile_db)                    # rule 3
     v.assumes = [a for f in files for a in assume_texts(f, os.path.relpath(f, hdir))]
     for n in cfg.get("models", []):
         v.assumes += assume_texts(run.MODELS / f"{n}.c", f"models/{n}.c")
@@ -598,6 +630,8 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
         return
     v.ok = True
     v.audited_tier = tier
+    # No mutants are sampled below T2 (or for T3, for now): every entry is unused.
+    v.unused_equivalents = _describe(_equivalents(cfg))
     if tier == "T3":                                                    # rule 5
         if "unwind" in cfg:
             v.problems.append("T3: proof.toml must not set unwind")

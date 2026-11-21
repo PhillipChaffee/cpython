@@ -144,6 +144,48 @@ class AuditFixtureTest(unittest.TestCase):
         self.assertTrue(v.ok, v.problems)
         self.assertEqual(v.stubs, ["harness:provider"])
 
+    def test_include_of_other_proof_code_is_rejected(self):
+        v = audit.audit(FIX / "foreign_include_harness")
+        self.assertFalse(v.ok)
+        self.assertIn("includes Tools/proofs/tests/fixtures/shared_helper/helper.h, proof code "
+                      "outside the harness directory that no audit rule checks", v.problems)
+
+    def test_symlink_out_of_harness_directory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = _copy(FIX / "loop_harness_ok", tmp,
+                      edit_c=lambda c: '#include "check.h"\n' + c)
+            outside = pathlib.Path(tmp) / "elsewhere.h"
+            outside.write_text("/* outside the harness directory */\n")
+            os.symlink(outside, h / "check.h")
+            v = audit.audit(h, out=pathlib.Path(tmp) / "out")
+        self.assertFalse(v.ok)
+        self.assertIn("check.h is a symlink to", " ".join(v.problems))
+
+    def test_header_assumes_counted_by_runner_and_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = _copy(FIX / "loop_harness_ok", tmp,
+                      edit_c=lambda c: '#include "bound.h"\n' + c.replace(
+                          "int s = sum(a, n);", "bound(n);\n    int s = sum(a, n);"))
+            (h / "bound.h").write_text("static void bound(int n) { __CPROVER_assume(n >= 0); }\n")
+            out = pathlib.Path(tmp) / "out"
+            r = run.run_harness(h, out=out)
+            self.assertEqual(r.status, "pass", r.detail)
+            self.assertEqual(r.assumes, 3)
+            v = audit.audit(h, out=out)
+            self.assertEqual(len(v.assumes), r.assumes)
+            self.assertIn("bound.h:1: __CPROVER_assume(n >= 0)", v.assumes)
+            (h / "bound.h").write_text("static void bound(int n) { assert(n >= 0); }\n")
+            r = run.run_harness(h, out=out)
+        self.assertEqual(r.status, "error")
+        self.assertIn("bound.h calls assert()", r.detail)
+
+    def test_unused_equivalents_reported_below_t2(self):
+        entry = '\n[[equivalent_mutants]]\noffset = 0\ndiff = "a ==> b"\nreason = "r"\n'
+        v = self.audit_copy(FIX / "loop_harness_ok",
+                            edit_toml=lambda t: t.replace('"T2"', '"T1"') + entry)
+        self.assertTrue(v.ok, v.problems)
+        self.assertEqual(v.unused_equivalents, ["offset 0: a ==> b"])
+
     def test_bool_offset_is_rejected(self):
         cfg = {"equivalent_mutants": [{"offset": True, "diff": "a ==> b", "reason": "r"}]}
         with self.assertRaises(audit.AuditError):

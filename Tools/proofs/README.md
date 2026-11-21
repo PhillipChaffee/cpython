@@ -57,7 +57,9 @@ A harness is a directory `harnesses/<source>/<function>/` with two files:
   callers guarantee, calls the function and states postconditions with
   `__CPROVER_assert()`. The compile database defines `NDEBUG`, so `assert()`
   checks nothing: the runner reports `error` for a harness that calls
-  `assert()`, and for a T2/T3 harness with no `__CPROVER_assert()`.
+  `assert()`, and for a T2/T3 harness with no `__CPROVER_assert()`. It checks
+  all harness code (see "Audit"), not only harness.c, and counts the assumes in
+  all of it.
 - `proof.toml`:
 
   ```toml
@@ -144,6 +146,16 @@ its `input_hash` matches; otherwise it runs the harness again first.
    Helpers that only `harness()` calls are not stubs. `stubs` lists
    `models/<name>.c`, `contracts/<name>.c`, `havoc:<name>` and
    `harness:<name>`.
+   A harness's compilation may read only these files (from `goto-cc -M`):
+   - harness code (by real path, so a symlink in the harness directory that
+     points outside is refused);
+   - `models/` and `contracts/`;
+   - repository files outside `Tools/proofs/`;
+   - files outside the repository.
+   For a fixture whose `source` is under `tests/fixtures/`, that source and the
+   files beside it are allowed too. Any other file under `Tools/proofs/`, such
+   as another harness's directory or a shared helper, makes `ok` false, because
+   no rule would check it.
 4. **Mutation (T2; T3 once contract mode exists).** universalmutator (`mutate --noCheck --lines`)
    mutates only the target function's lines, as CBMC's source locations give
    them. Each mutant is a full copy of the source file in a temporary tree with
@@ -169,6 +181,8 @@ its `input_hash` matches; otherwise it runs the harness again first.
 
    An entry that matches no mutant in the sample is listed in the verdict's
    `unused_equivalents` (a note, not a problem), so a stale offset is visible.
+   Below T2, and for T3 until contract mode exists, no mutants are sampled, so
+   every entry is listed there.
    A target guarded by `abort()` or `Py_FatalError()` may be capped at T1. A
    mutant that makes the guard fire on every input is vacuous, and a vacuous
    mutant counts as not killed.

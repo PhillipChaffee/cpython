@@ -174,14 +174,18 @@ _COMMENT_OR_STRING = re.compile(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\\n])*"|\'(?:\\
 _PLAIN_ASSERT = re.compile(r"(?<![\w])assert\s*\(")
 
 
-def _check_assertions(harness_c, tier):
-    """Refuse harnesses whose checks would silently vanish."""
-    code = _COMMENT_OR_STRING.sub(" ", harness_c.read_text(errors="replace"))
-    if _PLAIN_ASSERT.search(code):
-        raise HarnessError("harness.c calls assert(), which NDEBUG compiles out; "
-                           "use __CPROVER_assert(cond, \"description\")")
-    if tier in ("T2", "T3") and "__CPROVER_assert" not in code:
-        raise HarnessError(f"tier {tier} needs a postcondition, but harness.c has no __CPROVER_assert")
+def _check_assertions(files, tier, hdir):
+    """Refuse harnesses whose checks would silently vanish (``files``: harness code)."""
+    found = False
+    for f in files:
+        code = _COMMENT_OR_STRING.sub(" ", pathlib.Path(f).read_text(errors="replace"))
+        if _PLAIN_ASSERT.search(code):
+            raise HarnessError(f"{os.path.relpath(f, hdir)} calls assert(), which NDEBUG "
+                               "compiles out; use __CPROVER_assert(cond, \"description\")")
+        found = found or "__CPROVER_assert" in code
+    if tier in ("T2", "T3") and not found:
+        raise HarnessError(f"tier {tier} needs a postcondition, but the harness code "
+                           "has no __CPROVER_assert")
 
 
 def _covered(goals, harness_c, cwd, root):
@@ -226,9 +230,10 @@ def _harness_end_reached(goals, harness_c, cwd):
 GOTO_PLACEHOLDER = "harness.goto"
 
 
-def _dependencies(cmd, cwd):
+def _dependencies(cmd, cwd, resolve=True):
     """Every file the preprocessor reads for the translation units of ``cmd``
-    (``goto-cc -M`` with the same flags), as real paths."""
+    (``goto-cc -M`` with the same flags), as real paths, or with ``resolve``
+    false as absolute paths with symlinks left in place."""
     dep = [a for a in cmd if a not in ("-o", GOTO_PLACEHOLDER)]
     dep.insert(1, "-M")
     r = subprocess.run(dep, cwd=cwd, capture_output=True, text=True, errors="replace",
@@ -237,7 +242,23 @@ def _dependencies(cmd, cwd):
         err = [l for l in r.stderr.splitlines() if "error" in l.lower()] or r.stderr.splitlines()
         raise HarnessError("goto-cc -M failed: " + (err[0].strip() if err else f"exit {r.returncode}")[:300])
     words = r.stdout.replace("\\\n", " ").split()
-    return {os.path.realpath(os.path.join(cwd, w)) for w in words if not w.endswith(":")}
+    paths = {os.path.normpath(os.path.join(cwd, w)) for w in words if not w.endswith(":")}
+    return {os.path.realpath(p) for p in paths} if resolve else paths
+
+
+def inside(path, directory):
+    """Whether ``path`` (resolved) lies below ``directory`` (resolved)."""
+    return os.path.realpath(path).startswith(os.path.realpath(directory) + os.sep)
+
+
+def harness_files(hdir, cfg, compile_db=None):
+    """Harness code: harness.c and every file it includes from the harness
+    directory, by real path (``goto-cc -M`` with the run's flags), sorted.
+    A symlink in the directory whose target lies outside is not harness code."""
+    cmd, cwd, _ = goto_cc_command(hdir, cfg, GOTO_PLACEHOLDER, compile_db)
+    files = {os.path.realpath(pathlib.Path(hdir) / "harness.c")}
+    files |= {f for f in _dependencies(cmd, cwd) if inside(f, hdir)}
+    return sorted(files)
 
 
 def input_hash(hdir, *, compile_db=None):
@@ -361,9 +382,10 @@ def _run(hdir, result, compile_db, include_first=(), timeout=TIMEOUT):
     harness_c = hdir / "harness.c"
     if not harness_c.exists():
         raise HarnessError(f"{harness_c} not found")
-    _check_assertions(harness_c, cfg["tier"])
+    code = harness_files(hdir, cfg, compile_db)
+    _check_assertions(code, cfg["tier"], hdir)
     model_srcs = [MODELS / f"{n}.c" for n in cfg.get("models", [])]
-    result.assumes = _count_assumes([harness_c, *model_srcs])
+    result.assumes = _count_assumes([*map(pathlib.Path, code), *model_srcs])
 
     # A run against substituted sources (include_first) is not a run of the
     # harness's recorded inputs, so it carries no input hash.  Otherwise the
