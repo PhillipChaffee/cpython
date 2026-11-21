@@ -1,0 +1,54 @@
+# Files outside the proof denominator. fnmatch globs against repo-relative paths.
+# Generated from the X: buckets of docs/superpowers/plans/2026-11-21-cpython-proof-coverage-scope.py.
+exclude = [
+    # X: vendored, verified upstream in F*
+    "Modules/_hacl/*",
+    # X: vendored third-party
+    "Modules/expat/*",
+    "Modules/_decimal/libmpdec/*",
+    "Objects/mimalloc/*",
+    "Include/internal/mimalloc/*",
+    "Modules/_ctypes/darwin/*",
+    "Modules/_ctypes/libffi*",
+    # X: other platforms
+    "PC/*",
+    "PCbuild/*",
+    "Mac/*",
+    "iOS/*",
+    "Android/*",
+    "Apple/*",
+    "Platforms/*",
+    "Python/dynload_win.c",
+    "Python/dynload_hpux.c",
+    "Python/emscripten_*",
+    "Modules/_wmi*",
+    "Modules/_winapi.c",
+    "Modules/overlapped.c",
+    "Modules/_scproxy.c",
+    "Python/thread_nt.h",
+    "Python/asm_trampoline*",
+    # X: JIT machine-code emission
+    "Python/jit*.c",
+    "Python/perf_jit_trampoline.c",
+    "Tools/jit/*",
+    "Include/internal/pycore_jit*.h",
+    # X: test, demo and example code
+    "Modules/_test*",
+    "Modules/_xx*",
+    "Modules/xx*",
+    "Lib/test/*",
+    "Doc/*",
+    "Tools/*",
+    "Modules/_ctypes/_ctypes_test*",
+    "Programs/_test*",
+    "Programs/test_*",
+    "Programs/_freeze_module.c",
+    "Programs/_bootstrap_python.c",
+    "Programs/check_*",
+    "Modules/getpath_noop.c",
+    "Python/frozen_modules/*",
+    "Lib/*",
+    # X: build configuration probes
+    "pyconfig.h.in",
+    "Misc/platform_triplet.c",
+]
