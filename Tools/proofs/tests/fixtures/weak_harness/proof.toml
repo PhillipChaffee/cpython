@@ -1,0 +1,9 @@
+source = "Tools/proofs/tests/fixtures/weak.c"
+function = "clamp_sum"
+tier = "T2"
+unwind = 1
+max_size = 4
+models = []
+contracts = []
+disable_checks = []
+disable_reason = ""

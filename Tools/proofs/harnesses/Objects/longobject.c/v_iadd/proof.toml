@@ -7,3 +7,8 @@ models = []
 contracts = []
 disable_checks = []
 disable_reason = ""
+
+# Mutants that change nothing a caller can observe (callers guarantee m >= n).
+[[equivalent_mutants]]
+diff = "for (; carry && i < m; ++i) { ==> for (; carry && i != m; ++i) {"
+reason = "i enters this loop equal to n <= m and grows by 1, so it reaches m before it can pass it; i < m and i != m agree on every iteration"

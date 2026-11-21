@@ -17,6 +17,7 @@ import concurrent.futures
 import dataclasses
 import fnmatch
 import functools
+import hashlib
 import json
 import os
 import pathlib
@@ -71,6 +72,10 @@ class Result:
     function the proof reached, i.e. one with a satisfied cover goal, plus
     harness(); properties of functions the harness never reaches are left out.
     0 unless the status is "pass"."""
+    input_hash: str = ""
+    """input_hash() of the harness when it was run ("" if it could not be computed)."""
+    cbmc_flags: list = dataclasses.field(default_factory=list)
+    """The check and unwind flags the property run of cbmc was given."""
 
     def to_json(self):
         return dataclasses.asdict(self)
@@ -144,9 +149,9 @@ def _stub_sources(cfg):
     return srcs
 
 
-def _cbmc_json(cmd, cwd):
+def _cbmc_json(cmd, cwd, timeout=TIMEOUT):
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                       errors="replace", timeout=TIMEOUT)
+                       errors="replace", timeout=timeout)
     if r.returncode not in (0, 10):
         tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
         raise HarnessError(f"cbmc exit {r.returncode}: {tail[0][:200]}")
@@ -218,13 +223,39 @@ def _harness_end_reached(goals, harness_c, cwd):
     return status == "satisfied"
 
 
-def run_harness(hdir, out=OUT, compile_db=None):
-    """Run one harness; compile_db ({source path: entry}) defaults to build/proofs."""
+def input_hash(hdir):
+    """sha256 over harness.c, proof.toml, the source file and every listed model
+    and contract, each prefixed by its repo-relative path.
+
+    Raises HarnessError when proof.toml is invalid or a file is missing.
+    """
+    hdir = pathlib.Path(hdir).resolve()
+    cfg = _read_config(hdir)
+    files = [hdir / "harness.c", hdir / "proof.toml", ROOT / cfg["source"], *_stub_sources(cfg)]
+    h = hashlib.sha256()
+    for path in files:
+        try:
+            data = pathlib.Path(path).read_bytes()
+        except OSError as exc:
+            raise HarnessError(f"{path} not readable: {exc.strerror}") from None
+        rel = os.path.relpath(os.path.realpath(path), ROOT).encode()
+        h.update(b"%d:%s\0%d:" % (len(rel), rel, len(data)))
+        h.update(data)
+    return h.hexdigest()
+
+
+def run_harness(hdir, out=OUT, compile_db=None, include_first=(), timeout=TIMEOUT):
+    """Run one harness; compile_db ({source path: entry}) defaults to build/proofs.
+
+    include_first: directories searched for #include before all other include
+    paths (the audit uses this to substitute a mutated copy of the source).
+    timeout: seconds allowed for each goto-cc or cbmc call.
+    """
     hdir = pathlib.Path(hdir).resolve()
     start = time.monotonic()
     result = Result(status="error", tier="")
     try:
-        _run(hdir, result, compile_db)
+        _run(hdir, result, compile_db, include_first, timeout)
     except (HarnessError, StaleBuild) as exc:
         result.status, result.detail = "error", str(exc)
     except subprocess.TimeoutExpired as exc:
@@ -240,18 +271,14 @@ def _count_assumes(paths):
     return sum(p.read_text(errors="replace").count("__CPROVER_assume") for p in paths)
 
 
-def _run(hdir, result, compile_db):
-    cfg = _read_config(hdir)
-    result.tier = cfg["tier"]
-    result.stubs = list(cfg.get("models", [])) + list(cfg.get("contracts", []))
-    harness_c = hdir / "harness.c"
-    if not harness_c.exists():
-        raise HarnessError(f"{harness_c} not found")
-    _check_assertions(harness_c, cfg["tier"])
-    model_srcs = [MODELS / f"{n}.c" for n in cfg.get("models", [])]
-    stubs = _stub_sources(cfg)
-    result.assumes = _count_assumes([harness_c, *model_srcs])
+def compile_harness(hdir, cfg, goto, compile_db=None, include_first=(), timeout=TIMEOUT):
+    """goto-cc harness.c and its listed models/contracts into ``goto``.
 
+    Returns (cwd, root): the directory cbmc must run in (paths in its output
+    are relative to it) and the directory covered lines are reported against.
+    """
+    harness_c = hdir / "harness.c"
+    stubs = _stub_sources(cfg)
     source = (ROOT / cfg["source"]).resolve()
     if not source.exists():
         raise HarnessError(f"source {cfg['source']} not found")
@@ -262,23 +289,46 @@ def _run(hdir, result, compile_db):
         flags, cwd = [], str(ROOT)
     # Fixtures live under Tools/proofs; report their lines relative to their own directory.
     root = str(source.parent if HERE in source.parents else ROOT)
-    flags = [*flags, f"-I{ROOT}", f"-I{MODELS}", f"-I{CONTRACTS}", f"-I{source.parent}"]
+    flags = [*(f"-I{d}" for d in include_first), *flags,
+             f"-I{ROOT}", f"-I{MODELS}", f"-I{CONTRACTS}", f"-I{source.parent}"]
+    cmd = ["goto-cc", *flags, str(harness_c), *map(str, stubs), "-o", str(goto)]
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                       errors="replace", timeout=timeout)
+    if r.returncode != 0:
+        err = [l for l in r.stderr.splitlines() if "error" in l.lower()] or r.stderr.splitlines()
+        raise HarnessError("goto-cc failed: " + (err[0].strip() if err else f"exit {r.returncode}")[:300])
+    return cwd, root
+
+
+def cbmc_base(goto, cfg):
+    """The cbmc command up to (not including) the check flags."""
+    base = ["cbmc", str(goto), "--function", ENTRY]
+    if "unwind" in cfg:
+        base += ["--unwind", str(cfg["unwind"])]
+    return base
+
+
+def _run(hdir, result, compile_db, include_first=(), timeout=TIMEOUT):
+    cfg = _read_config(hdir)
+    result.tier = cfg["tier"]
+    result.stubs = list(cfg.get("models", [])) + list(cfg.get("contracts", []))
+    harness_c = hdir / "harness.c"
+    if not harness_c.exists():
+        raise HarnessError(f"{harness_c} not found")
+    _check_assertions(harness_c, cfg["tier"])
+    model_srcs = [MODELS / f"{n}.c" for n in cfg.get("models", [])]
+    result.assumes = _count_assumes([harness_c, *model_srcs])
+    result.input_hash = input_hash(hdir)
 
     with tempfile.TemporaryDirectory() as tmp:
         goto = os.path.join(tmp, "harness.goto")
-        cmd = ["goto-cc", *flags, str(harness_c), *map(str, stubs), "-o", goto]
-        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                           errors="replace", timeout=TIMEOUT)
-        if r.returncode != 0:
-            err = [l for l in r.stderr.splitlines() if "error" in l.lower()] or r.stderr.splitlines()
-            raise HarnessError("goto-cc failed: " + (err[0].strip() if err else f"exit {r.returncode}")[:300])
+        cwd, root = compile_harness(hdir, cfg, goto, compile_db, include_first, timeout)
 
-        base = ["cbmc", goto, "--function", ENTRY]
-        if "unwind" in cfg:
-            base += ["--unwind", str(cfg["unwind"])]
+        base = cbmc_base(goto, cfg)
         disabled = set(cfg.get("disable_checks", []))
         checks = [c for c in CHECKS if c not in disabled]
-        code, msgs = _cbmc_json([*base, *checks, "--json-ui"], cwd)
+        result.cbmc_flags = [*base[4:], *checks]
+        code, msgs = _cbmc_json([*base, *checks, "--json-ui"], cwd, timeout)
         props = _section(msgs, "result")
         failed = [p for p in props if p.get("status") != "SUCCESS"]
         if code == 10 or failed:
@@ -287,7 +337,7 @@ def _run(hdir, result, compile_db):
             result.detail = f"{len(failed)} failed: " + "; ".join(names[:10])
             return
 
-        _, msgs = _cbmc_json([*base, "--cover", "location", "--json-ui"], cwd)
+        _, msgs = _cbmc_json([*base, "--cover", "location", "--json-ui"], cwd, timeout)
         goals = _section(msgs, "goals")
         if not _harness_end_reached(goals, harness_c, cwd):
             # Contradictory assumptions make every property hold trivially.

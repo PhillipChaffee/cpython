@@ -7,3 +7,20 @@ models = []
 contracts = []
 disable_checks = []
 disable_reason = ""
+
+# Mutants that change nothing a caller can observe (callers pass len >= 0).
+[[equivalent_mutants]]
+diff = "for (; p < e; p++) { ==> for (; p != e; p++) {"
+reason = "p starts at cptr and steps by 1 to e = cptr + len with len >= 0, so p < e and p != e agree on every iteration"
+
+[[equivalent_mutants]]
+diff = "if (len == 1 && Py_ISALNUM(*p)) ==> if (len == (1==1) && Py_ISALNUM(*p))"
+reason = "(1==1) is the int 1, so the condition is unchanged"
+
+[[equivalent_mutants]]
+diff = "if (len == 0) ==> if (len <= 0)"
+reason = "len >= 0 (caller contract and harness assumption), so len <= 0 is len == 0"
+
+[[equivalent_mutants]]
+diff = "if (len == 1 && Py_ISALNUM(*p)) ==> if (len == -1 && Py_ISALNUM(*p))"
+reason = "this disables the single-byte shortcut; the loop below then returns the same answer for len == 1, and len == -1 never occurs"

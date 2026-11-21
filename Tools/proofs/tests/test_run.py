@@ -129,6 +129,16 @@ class RunFixtureTest(unittest.TestCase):
         self.assertEqual(r.covered.get("inc/inl.h"), [4, 5])
         self.assertEqual(r.covered.get("use.c"), [3])
 
+    def test_include_first_substitutes_the_source(self):
+        # A copy of loop.c that reads a[n] (out of bounds) must be the one compiled.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = (FIX / "loop.c").read_text().replace("i < n", "i <= n")
+            (pathlib.Path(tmp) / "loop.c").write_text(src)
+            r = run.run_harness(FIX / "loop_harness_ok", out=pathlib.Path(tmp) / "out",
+                                include_first=[tmp])
+        self.assertEqual(r.status, "fail", r.detail)
+        self.assertEqual(r.input_hash, run.input_hash(FIX / "loop_harness_ok"))
+
     def test_disable_checks_outside_list_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             h = pathlib.Path(tmp) / "h"
