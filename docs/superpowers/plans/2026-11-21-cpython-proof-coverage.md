@@ -27,6 +27,26 @@ Read this before anything else; it sets what the number can honestly claim.
 - **100% of lines will not be reached.** Lines that stay unproved are listed in a generated `unreached.md` with a reason code each, so the gap is visible instead of silent.
 - **Targets are re-baselined after the pilot.** Task 6 measures real cost per function; the wave targets in Task 10 are starting goals, not commitments.
 
+## Verified by spike (2026-11-21)
+
+The core mechanism was run once, by hand, on this tree before the plan was finalised. No tooling from the tasks below exists yet; these are the facts the tasks build on.
+
+| Check | Result |
+| --- | --- |
+| CBMC available | `apt-get install cbmc` on Ubuntu 24.04 gives CBMC 5.95.1 with `goto-cc` and `goto-instrument` |
+| Real source compiles for proof | A harness that `#include`s `Objects/longobject.c` compiles with `goto-cc` in 3 s. Flags needed: `-DPy_BUILD_CORE -IInclude -IInclude/internal -IInclude/internal/mimalloc -I<build dir> -I. -IObjects`; only `./configure` is needed first, not a full `make` |
+| Proof passes on unmodified C | `v_iadd` with `0 <= n <= m <= 4`, digits `<= PyLong_MASK`, `--unwind 6`, all safety checks: `VERIFICATION SUCCESSFUL`, 33 s |
+| Proof fails on a planted bug | Replacing `x[i] = carry & PyLong_MASK` with `x[i] = carry` in a copy: `assertion x[i] <= PyLong_MASK: FAILURE` |
+| Coverage output is usable | `--cover location --json-ui` reports 6 of 6 blocks of `v_iadd` covered, with exact source lines in a `basicBlockLines` field per goal |
+| Denominator comes for free | The same run lists every block of the translation unit: 4,360 blocks in 307 functions for `longobject.c`, 14 covered by this one harness |
+
+What this changes in the tasks:
+
+- **Task 1:** use the apt package (5.95.1) as the pin unless Task 7's spike needs a newer release for contracts.
+- **Task 2:** build the inventory from the full goal list of a `--cover location` run per translation unit, using `basicBlockLines`, rather than from `--show-goto-functions`.
+- **Task 3:** CBMC checks properties across the whole translation unit (7,420 here), and unreachable ones pass trivially. The runner must report only properties in functions the harness reaches. Roughly 30 s per harness on a large file means the full campaign needs parallel runs; `--drop-unused-functions` did not reduce the time in this spike.
+- **Not yet tested:** function and loop contracts (Task 7), models for heap objects (Task 6), `bear`, `universalmutator`, GenMC, TLC.
+
 ## Global Constraints
 
 - Proofs run on unmodified sources. No edits to any file outside `Tools/proofs/`, `docs/superpowers/`, and `.github/workflows/proofs.yml`.
@@ -106,7 +126,7 @@ class ToolchainTest(unittest.TestCase):
 ```
 
 - [ ] **Step 2: Run it.** `python3 -m unittest Tools.proofs.tests.test_toolchain -v` — expected: ERROR, `cbmc` not found.
-- [ ] **Step 3: Write `install.sh`.** Install the latest CBMC 6.x release `.deb` from the `diffblue/cbmc` GitHub releases, `bear` from apt, `universalmutator` from pip, `lcov` from apt. Write the exact versions resolved into `versions.env`, then change the script to install those pinned versions.
+- [ ] **Step 3: Write `install.sh`.** Install `cbmc` from apt (5.95.1 on Ubuntu 24.04, confirmed working), `bear` from apt, `universalmutator` from pip, `lcov` from apt. Write the exact versions resolved into `versions.env`, then change the script to install those pinned versions.
 - [ ] **Step 4: Write `build_db.sh`.** `mkdir -p build/proofs && cd build/proofs && ../../configure && bear -- make -j"$(nproc)"`.
 - [ ] **Step 5: Run both scripts, then the test.** Expected: 2 tests PASS.
 - [ ] **Step 6: Add `build/proofs/` and `Tools/proofs/out/` to `.gitignore`; write the README section "Setup"; commit.**
@@ -121,7 +141,7 @@ class ToolchainTest(unittest.TestCase):
 
 **Interfaces:**
 - Consumes: `build/proofs/compile_commands.json`.
-- Produces: `inventory.build(compile_db: Path, scope: Path) -> Inventory`; CLI `python3 Tools/proofs/inventory.py --out Tools/proofs/out/inventory.json`. JSON shape: `{"files": {"<repo-relative path>": {"functions": {"<name>": {"lines": [int, ...], "static": bool}}}}, "excluded": ["<path>", ...]}`. A line is "executable" if any GOTO instruction in `cbmc --show-goto-functions --json-ui` has it as its source location.
+- Produces: `inventory.build(compile_db: Path, scope: Path) -> Inventory`; CLI `python3 Tools/proofs/inventory.py --out Tools/proofs/out/inventory.json`. JSON shape: `{"files": {"<repo-relative path>": {"functions": {"<name>": {"lines": [int, ...], "static": bool}}}}, "excluded": ["<path>", ...]}`. A line is "executable" if it appears in the `basicBlockLines` of any goal in `cbmc --cover location --json-ui` for its translation unit (see "Verified by spike").
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -146,7 +166,7 @@ def test_ifdef_off_code_is_absent(self):
 
 - [ ] **Step 2: Run to verify failure.** `python3 -m unittest Tools.proofs.tests.test_inventory -v` — FAIL, module missing.
 - [ ] **Step 3: Write `scope.toml`** with key `exclude = [...]` holding the glob list from Global Constraints verbatim.
-- [ ] **Step 4: Implement `inventory.py`.** For each compile-database entry in scope, run `goto-cc` with that entry's `-I`/`-D` flags, then `cbmc --show-goto-functions --json-ui`, and collect source lines per function. Lines from headers (`static inline`) are attributed to the header path.
+- [ ] **Step 4: Implement `inventory.py`.** For each compile-database entry in scope, run `goto-cc` with that entry's `-I`/`-D` flags, then `cbmc --cover location --json-ui` with an empty entry function, and collect `basicBlockLines` per function from every goal, satisfied or not. Lines from headers (`static inline`) are attributed to the header path.
 - [ ] **Step 5: Run tests — PASS. Run the CLI on the real tree** and record the totals (files, functions, lines) in the README under "Denominator".
 - [ ] **Step 6: Commit.**
 
