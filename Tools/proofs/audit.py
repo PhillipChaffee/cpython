@@ -13,7 +13,10 @@ Rules (see README.md, "Audit"):
    the repository except system headers, every assume lies in harness code or
    a listed model/contract, harness code sets no macro before the code under
    proof unless proof.toml lists it in ``predefine``, and every body-less
-   function the proof reaches is listed in ``havoc_callees``;
+   function the proof reaches is listed in ``havoc_callees``; contract
+   clauses appear only in contracts/ headers, and every
+   ``replace_contracts`` entry has a current, passing, audited harness that
+   enforces the same contract file (no orphan contracts);
 4. T2/T3: mutants of the target function's lines must all fail the proof,
    else the harness is demoted to T1 (``equivalent_mutants`` excepted);
 5. T3: no ``unwind`` and a contract-mode run (not implemented yet: demoted).
@@ -59,6 +62,9 @@ class Verdict:
     unused_equivalents: list = dataclasses.field(default_factory=list)
     """equivalent_mutants entries that match no sampled mutant (a note, not a problem)."""
     input_hash: str = ""
+    contract_hashes: dict = dataclasses.field(default_factory=dict)
+    """{"contracts/<file>": sha256} of the listed contract files, for a
+    harness with enforce_contract (what callers' replace_contracts match)."""
 
     def to_json(self):
         return dataclasses.asdict(self)
@@ -181,12 +187,33 @@ def _logical_lines(path):
     return [(n, c, raw) for (n, raw), c in zip(out, code)]
 
 
-def _directives(path, code, stubs, seen):
+def _resolve_include(path, operand, search):
+    """The real path of the file ``#include operand`` in ``path`` reads, or None.
+
+    ``"name"`` is looked up in the including file's directory, then in
+    ``search`` (the -I directories, then the system ones, in order);
+    ``<name>`` only in ``search``.  The first existing file wins, as in gcc.
+    """
+    m = re.match(r'"([^"]+)"|<([^>]+)>', operand)
+    if m is None:
+        return None             # a computed include (#include MACRO)
+    name = m.group(1) or m.group(2)
+    dirs = ([os.path.dirname(path)] if m.group(1) else []) + list(search)
+    for d in dirs:
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand):
+            return os.path.realpath(cand)
+    return None
+
+
+def _directives(path, code, stubs, seen, search=()):
     """The preprocessor directives of harness.c in the order the preprocessor
-    meets them, following #include into harness code and stub files:
-    (kind, name, path, line), kind "define" | "undef" | "pragma" | "outside"
-    (an #include of any other file; ``name`` is its operand).  Conditionals are
-    ignored: a directive in a skipped branch counts."""
+    meets them, following #include ("..." and <...>) into harness code and
+    stub files: (kind, name, path, line), kind "define" | "undef" | "pragma"
+    | "forbidden" (#import, #include_next) | "outside" (an #include of any
+    other file; ``name`` is its operand).  ``search``: the include search
+    directories (see _resolve_include).  Conditionals are ignored: a
+    directive in a skipped branch counts."""
     for line, text, raw in _logical_lines(path):
         if re.search(r"\b_Pragma\b", text):
             yield "pragma", "_Pragma", path, line
@@ -200,27 +227,28 @@ def _directives(path, code, stubs, seen):
         elif kind == "pragma":
             if after.split() != ["once"]:
                 yield "pragma", rest, path, line
+        elif kind in ("import", "include_next"):
+            # Neither is followed, so either could bring in a macro unseen.
+            yield "forbidden", f"#{kind} {rest}", path, line
+            yield "outside", rest, path, line
         else:
-            target, quoted = None, re.match(r'"([^"]+)"', rest)
-            if quoted and kind == "include":
-                # The including file's directory is searched first.
-                beside = os.path.realpath(os.path.join(os.path.dirname(path), quoted.group(1)))
-                if beside in code:
-                    target = beside
-                elif not os.path.exists(beside):
-                    for base in (run.MODELS, run.CONTRACTS):
-                        cand = os.path.realpath(os.path.join(base, quoted.group(1)))
-                        if cand in stubs:
-                            target = cand
-                            break
-            if target is None:
+            target = _resolve_include(path, rest, search)
+            if target is None or (target not in code and target not in stubs):
                 yield "outside", rest, path, line
             elif target not in seen:
                 seen.add(target)
-                yield from _directives(target, code, stubs, seen)
+                yield from _directives(target, code, stubs, seen, search)
 
 
-def predefines(hdir, cfg, code, stubs):
+def include_search(hdir, cfg, compile_db=None):
+    """The -I directories of the harness's compilation (absolute, in order),
+    then the compiler's system include directories."""
+    cmd, cwd, _ = run.goto_cc_command(hdir, cfg, run.GOTO_PLACEHOLDER, compile_db)
+    dirs = [os.path.normpath(os.path.join(cwd, a[2:])) for a in cmd if a.startswith("-I") and len(a) > 2]
+    return [*dirs, *run.system_include_dirs()]
+
+
+def predefines(hdir, cfg, code, stubs, search=()):
     """(problems, notes) for macros that harness code sets before the code under proof.
 
     A #define or #undef in harness code (or a model/contract header it
@@ -239,11 +267,15 @@ def predefines(hdir, cfg, code, stubs):
     start = os.path.realpath(pathlib.Path(hdir) / "harness.c")
     labels = {f: os.path.relpath(f, os.path.realpath(hdir)) for f in code}
     labels.update(stubs)
-    events = list(_directives(start, set(code), stubs, {start}))
+    events = list(_directives(start, set(code), stubs, {start}, search))
     last = max((n for n, e in enumerate(events) if e[0] == "outside"), default=-1)
     if last >= 0:
         _, operand, path, line = events[last]
         include = f"#include {operand} ({labels[path]}:{line})"
+    for kind, name, path, line in events:
+        if kind == "forbidden":
+            problems.append(f"{labels.get(path, path)}:{line}: {name}: #import and #include_next "
+                            "are not allowed in harness code; use #include")
     for kind, name, path, line in events[:max(last, 0)]:
         at = f"{labels[path]}:{line}"
         if kind == "pragma":
@@ -259,6 +291,104 @@ def predefines(hdir, cfg, code, stubs):
     notes = [f"predefine entry {a!r} matches no #define or #undef before the code under proof"
              for a in allowed if a not in used]
     return problems, notes
+
+
+# -- contracts -----------------------------------------------------------------
+
+_CLAUSE = re.compile(r"\b__CPROVER_(?:requires|ensures|assigns|frees)\b")
+
+
+def contract_clauses_outside(code, stubs, hdir):
+    """Problems for contract clauses in harness code or model files: a
+    contract there would be attached (and, for replace_contracts, assumed)
+    without the enforcing harness that contracts/ files need."""
+    files = [(f, os.path.relpath(f, os.path.realpath(hdir))) for f in code]
+    files += [(f, label) for f, label in stubs.items() if label.startswith("models/")]
+    out = []
+    for f, label in files:
+        text = _strip_comments(pathlib.Path(f).read_text(errors="replace"))
+        for m in _CLAUSE.finditer(text):
+            out.append(f"{label}:{text.count(chr(10), 0, m.start()) + 1}: contract clauses "
+                       "belong in a listed contracts/ header")
+            break
+    return out
+
+
+def file_sha256(path):
+    import hashlib
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+
+def contract_files(cfg, stubs, name):
+    """Labels ("contracts/<file>") of the listed contract files that attach
+    contract clauses to function ``name``, with their real paths."""
+    out = {}
+    pattern = re.compile(r"\b" + re.escape(name) + r"\s*\([^;{}]*?" + _CLAUSE.pattern, re.S)
+    for path, label in stubs.items():
+        if label.startswith("contracts/") and pattern.search(
+                _strip_comments(pathlib.Path(path).read_text(errors="replace"))):
+            out[label] = path
+    return out
+
+
+def _harness_dirs(hdir):
+    """Harness directories that may enforce a contract for ``hdir``: every
+    harness under harnesses/, and for a harness elsewhere (a fixture) its
+    sibling directories too."""
+    dirs = set(run.discover())
+    if not run.inside(hdir, run.HARNESSES):
+        dirs |= {p.parent for p in pathlib.Path(hdir).parent.glob("*/proof.toml")}
+    return sorted(dirs)
+
+
+def orphan_contracts(hdir, cfg, stubs, out, compile_db=None):
+    """Problems for replace_contracts entries without an enforcing harness.
+
+    A contract may replace calls to f only if some harness with
+    ``enforce_contract = f`` passes and its audit is ok and current
+    (``input_hash`` equal to run.input_hash() of it now), and that audit
+    recorded, for every listed contract file that declares f's clauses, the
+    hash that file has now.
+    """
+    problems = []
+    for name in cfg.get("replace_contracts", []):
+        files = contract_files(cfg, stubs, name)
+        if not files:
+            problems.append(f"replace_contracts {name}: no listed contracts header declares "
+                            f"contract clauses for {name}")
+            continue
+        want = {label: file_sha256(path) for label, path in files.items()}
+        why = []
+        for other in _harness_dirs(hdir):
+            if os.path.realpath(other) == os.path.realpath(hdir):
+                continue
+            try:
+                ocfg = run._read_config(other)
+            except run.HarnessError:
+                continue
+            if ocfg.get("enforce_contract") != name:
+                continue
+            rel = run._out_dir(pathlib.Path(other).resolve(), pathlib.Path(out)) / "audit.json"
+            try:
+                verdict = json.loads(rel.read_text())
+            except (OSError, ValueError):
+                why.append(f"{other.name} has not been audited")
+                continue
+            if not verdict.get("ok"):
+                why.append(f"{other.name} failed its audit")
+            elif any(verdict.get("contract_hashes", {}).get(k) != v for k, v in want.items()):
+                why.append(f"{other.name} was audited against another version of "
+                           + ", ".join(sorted(want)))
+            elif verdict.get("input_hash") != run.input_hash(other, compile_db=compile_db):
+                why.append(f"the audit of {other.name} is stale")
+            else:
+                break
+        else:
+            problems.append(f"replace_contracts {name}: no enforcing harness (a passing, "
+                            f"audited harness with enforce_contract = \"{name}\" and the "
+                            f"current {', '.join(sorted(want))})"
+                            + (": " + "; ".join(why) if why else ""))
+    return problems
 
 
 # -- rule 1 ------------------------------------------------------------------
@@ -321,7 +451,8 @@ def goto_functions(out, cwd):
 def function_lines(functions, name, source):
     """Source lines of the instructions of function ``name`` located in ``source``."""
     source = os.path.realpath(source)
-    fn = functions.get(name)
+    # goto-instrument --enforce-contract moves the body of f into this function.
+    fn = functions.get(name + "_wrapped_for_contract_checking") or functions.get(name)
     return sorted(line for path, line in fn.locs if path == source) if fn else []
 
 
@@ -400,10 +531,11 @@ def reachability(goto, cfg, cwd, hdir, files, candidates):
             regex = "^(" + "|".join(map(re.escape, candidates)) + ")$"
             _cbmc(["goto-instrument", "--generate-function-body", regex,
                    "--generate-function-body-options", "assert-false", str(goto), target], cwd)
-        out = _cbmc([*run.cbmc_base(target, cfg), "--cover", "assertion", "--json-ui"], cwd)
+        out = _cbmc([*run.cover_base(target, cfg), "--cover", "assertion", "--json-ui"], cwd)
     goals = next((m["goals"] for m in json.loads(out) if "goals" in m), None)
     if goals is None:
         raise AuditError("cbmc --cover assertion printed no goals")
+    instrumented = _dfcc_checks(goto, cfg, cwd) if run.contract_mode(cfg) else set()
     goal_lines, unreachable, reached = set(), [], set()
     for g in goals:
         loc = g.get("sourceLocation", {})
@@ -419,6 +551,8 @@ def reachability(goto, cfg, cwd, hdir, files, candidates):
         # it was written (directly, through a macro, in a helper or header).
         rel = os.path.relpath(path, os.path.realpath(hdir))
         goal_lines.add((path, int(loc["line"])))
+        if (path, int(loc["line"]), g.get("description", "")) in instrumented:
+            continue        # a write-set check goto-instrument put into harness()
         if not sat:
             key = (rel, int(loc["line"]), g.get("description", ""))
             if key not in unreachable:
@@ -429,6 +563,24 @@ def reachability(goto, cfg, cwd, hdir, files, candidates):
                  "__CPROVER_assert has no assertion goal"
                  for f in files for line in assert_lines(f) if (f, line) not in goal_lines]
     return problems, sorted(reached)
+
+
+def _dfcc_checks(goto, cfg, cwd):
+    """{(path, line, description)} of the assigns/frees checks that
+    goto-instrument --dfcc adds to every function, harness() included.  In
+    harness() they are guarded by its (absent) write set, so they are never
+    reachable; they are not the harness's assertions."""
+    out = _cbmc([*run.cbmc_base(goto, cfg), *run.checks(cfg), "--show-properties", "--json-ui"], cwd)
+    props = next((m["properties"] for m in json.loads(out) if "properties" in m), [])
+    found = set()
+    for p in props:
+        if p.get("class") not in ("assigns", "frees"):
+            continue
+        loc = p.get("sourceLocation", {})
+        if "line" in loc:
+            found.add((os.path.realpath(os.path.join(loc.get("workingDirectory", cwd), loc.get("file", ""))),
+                       int(loc["line"]), p.get("description", "")))
+    return found
 
 
 # -- rule 4: mutation -----------------------------------------------------------
@@ -700,8 +852,17 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
     files, stub_files = run.proof_files(hdir, cfg, compile_db)
     fatal += line_directives(files, hdir)                               # rule 2
     fatal += foreign_includes(hdir, cfg, compile_db)                    # rule 3
-    predefine_problems, predefine_notes = predefines(hdir, cfg, files, stub_files)
+    predefine_problems, predefine_notes = predefines(hdir, cfg, files, stub_files,
+                                                     include_search(hdir, cfg, compile_db))
     fatal += predefine_problems
+    fatal += contract_clauses_outside(files, stub_files, hdir)
+    fatal += orphan_contracts(hdir, cfg, stub_files, out, compile_db)
+    if cfg.get("enforce_contract"):
+        v.contract_hashes = {label: file_sha256(path) for label, path in
+                             contract_files(cfg, stub_files, cfg["enforce_contract"]).items()}
+        if not v.contract_hashes:
+            fatal.append(f"enforce_contract {cfg['enforce_contract']}: no listed contracts "
+                         "header declares its contract clauses")
 
     havoc = cfg.get("havoc_callees", [])
     if not isinstance(havoc, list) or not all(isinstance(h, str) for h in havoc):
@@ -779,6 +940,14 @@ def main(argv=None):
     if not dirs:
         print("no harnesses matched", file=sys.stderr)
         return 1
+
+    def enforces(d):
+        try:
+            return bool(run._read_config(d).get("enforce_contract"))
+        except run.HarnessError:
+            return False
+    # Enforcing harnesses first: their verdicts are what replace_contracts checks.
+    dirs = sorted(dirs, key=lambda d: not enforces(d))
     rc = 0
     for d in dirs:
         start = time.monotonic()

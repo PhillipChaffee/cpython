@@ -19,6 +19,8 @@ void harness(void)
     Py_ssize_t len;
     __CPROVER_assume(0 <= len && len <= MAXLEN);    /* proof bound */
     char *buf = malloc(len + 1);
+    /* The caller's string exists: the harness's own allocation may not fail. */
+    __CPROVER_assume(buf != NULL);
     buf[len] = '\0';
 
     /* Any int: the documented contract is "0 or between 2 and 36", but the

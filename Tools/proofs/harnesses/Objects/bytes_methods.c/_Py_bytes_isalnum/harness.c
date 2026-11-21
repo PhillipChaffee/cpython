@@ -22,6 +22,8 @@ void harness(void)
     Py_ssize_t len;
     __CPROVER_assume(0 <= len && len <= MAXLEN);    /* proof bound */
     char *buf = malloc(len);
+    /* The caller's buffer exists: the harness's own allocation may not fail. */
+    __CPROVER_assume(buf != NULL);
 
     const unsigned char *ubuf = (const unsigned char *)buf;
 

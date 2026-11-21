@@ -48,7 +48,13 @@ CHECKS = (
     # Else cbmc turns "for (;;);" into an assumption that no listing shows;
     # with it, such a loop fails its unwinding assertion.
     "--no-self-loops-to-assumptions",
+    # Else malloc never fails and every proof silently assumes it succeeds.
+    "--malloc-may-fail", "--malloc-fail-null",
 )
+# The allocation flags apply to every cbmc run (cover runs too, else lines
+# reached only when malloc fails look unreachable), and to goto-instrument,
+# which fixes the library's malloc behaviour when it links the library.
+MALLOC = ("--malloc-may-fail", "--malloc-fail-null")
 DISABLEABLE = ("--unsigned-overflow-check", "--conversion-check")
 TIERS = ("T1", "T2", "T3")
 tool_env = inventory.tool_env
@@ -141,17 +147,66 @@ def _read_config(hdir):
         raise HarnessError(f"proof.toml: cannot disable {bad}; only {list(DISABLEABLE)}")
     if disabled and not cfg.get("disable_reason", "").strip():
         raise HarnessError("proof.toml: disable_checks needs a non-empty disable_reason")
+    bits = cfg.get("object_bits")
+    if bits is not None and (not isinstance(bits, int) or isinstance(bits, bool)
+                             or not 8 <= bits <= 20):
+        raise HarnessError("proof.toml: object_bits must be an int from 8 to 20")
+    enforce = cfg.get("enforce_contract")
+    if enforce is not None and enforce != cfg["function"]:
+        raise HarnessError("proof.toml: enforce_contract must name the function under proof "
+                           f"({cfg['function']!r})")
+    replace = cfg.get("replace_contracts", [])
+    if not isinstance(replace, list) or not all(isinstance(r, str) and r for r in replace):
+        raise HarnessError("proof.toml: replace_contracts must be a list of function names")
+    if cfg["function"] in replace:
+        raise HarnessError("proof.toml: replace_contracts must not name the function under proof")
+    if (enforce or replace) and not cfg.get("contracts"):
+        raise HarnessError("proof.toml: enforce_contract and replace_contracts need the "
+                           "contract header listed in contracts")
     return cfg
 
 
+def contract_mode(cfg):
+    """Whether the harness is instrumented with goto-instrument --dfcc."""
+    return bool(cfg.get("enforce_contract") or cfg.get("replace_contracts"))
+
+
+def instrument_command(cfg, raw, goto):
+    """goto-instrument command that applies the harness's contracts to ``raw``.
+
+    ``--enforce-contract f`` wraps f so that its requires clauses are
+    assumed and its ensures and assigns clauses checked; each
+    ``--replace-call-with-contract g`` replaces every call to g by its
+    contract: requires checked, assigns havocked, ensures assumed.  The
+    allocation flags must be given here too: goto-instrument links CBMC's
+    library, and the library's malloc keeps the behaviour it had then.
+    """
+    cmd = ["goto-instrument", "--dfcc", ENTRY, *MALLOC]
+    if cfg.get("enforce_contract"):
+        cmd += ["--enforce-contract", cfg["enforce_contract"]]
+    for name in cfg.get("replace_contracts", []):
+        cmd += ["--replace-call-with-contract", name]
+    return [*cmd, str(raw), str(goto)]
+
+
 def _stub_sources(cfg):
+    """The .c files of the listed models and contracts (compiled and linked).
+
+    An entry ``name`` is ``<kind>/name.c``, ``<kind>/name.h`` or both; a
+    header-only entry (models.h, a contract header) compiles nothing itself.
+    """
     srcs = []
     for kind, base in (("models", MODELS), ("contracts", CONTRACTS)):
-        for name in cfg.get(kind, []):
+        names = cfg.get(kind, [])
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            raise HarnessError(f"proof.toml: {kind} must be a list of strings")
+        for name in names:
             path = base / f"{name}.c"
-            if not path.exists():
-                raise HarnessError(f"{kind} entry {name!r}: {path} not found")
-            srcs.append(path)
+            if path.exists():
+                srcs.append(path)
+            elif not (base / f"{name}.h").exists():
+                raise HarnessError(f"{kind} entry {name!r}: neither {path} nor "
+                                   f"{base / (name + '.h')} found")
     return srcs
 
 
@@ -343,7 +398,11 @@ def input_hash(hdir, *, compile_db=None):
     base = cbmc_base(GOTO_PLACEHOLDER, cfg)
     put(b"goto-cc", json.dumps([*cmd, cwd]).encode())
     put(b"cbmc", json.dumps([[*base, *checks(cfg), "--json-ui"],
-                             [*base, "--cover", "location", "--json-ui"]]).encode())
+                             [*cover_base(GOTO_PLACEHOLDER, cfg), "--cover", "location",
+                              "--json-ui"]]).encode())
+    if contract_mode(cfg):
+        put(b"goto-instrument", json.dumps(["--drop-unused-functions",
+                                            instrument_command(cfg, "raw", "goto")]).encode())
     put(b"cbmc --version", inventory.cbmc_version().encode())
     return h.hexdigest()
 
@@ -580,13 +639,46 @@ def compile_harness(hdir, cfg, goto, compile_db=None, include_first=(), timeout=
     Returns (cwd, root): the directory cbmc must run in (paths in its output
     are relative to it) and the directory covered lines are reported against.
     """
-    cmd, cwd, root = goto_cc_command(hdir, cfg, goto, compile_db, include_first)
+    goto = str(goto)
+    out = goto + ".raw" if contract_mode(cfg) else goto
+    cmd, cwd, root = goto_cc_command(hdir, cfg, out, compile_db, include_first)
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                        errors="replace", timeout=timeout, env=tool_env())
     if r.returncode != 0:
         err = [l for l in r.stderr.splitlines() if "error" in l.lower()] or r.stderr.splitlines()
         raise HarnessError("goto-cc failed: " + (err[0].strip() if err else f"exit {r.returncode}")[:300])
+    if contract_mode(cfg):
+        _instrument(cfg, out, goto, cwd, timeout)
     return cwd, root
+
+
+_NO_CONTRACT = re.compile(r"Contract '([^']+)' not found")
+
+
+def _instrument(cfg, raw, goto, cwd, timeout):
+    """Apply the contracts: relink ``raw`` with harness() as entry point
+    (goto-instrument --dfcc needs one), then instrument it into ``goto``.
+    A named function without contract clauses is an error: goto-instrument
+    would derive an empty contract (no assigns, ensures true) for it."""
+    linked, used = raw + ".linked", raw + ".used"
+    # --dfcc instruments every function of the model and stops on functions
+    # it cannot (the __atomic_* library calls __CPROVER_fence, which has no
+    # body), so the functions harness() cannot reach (directly or through a
+    # function whose address is taken) are dropped first.
+    for cmd in (["goto-cc", "--function", ENTRY, raw, "-o", linked],
+                ["goto-instrument", "--drop-unused-functions", linked, used],
+                instrument_command(cfg, used, goto)):
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                           errors="replace", timeout=timeout, env=tool_env())
+        missing = sorted(set(_NO_CONTRACT.findall(r.stdout + r.stderr)))
+        if missing:
+            raise HarnessError("no contract clauses for " + ", ".join(missing)
+                               + "; declare them in the listed contracts header")
+        if r.returncode != 0:
+            lines = (r.stderr or r.stdout).strip().splitlines()
+            err = [l for l in lines if "error" in l.lower() or "invariant" in l.lower()] or lines[-1:]
+            raise HarnessError(f"{cmd[0]} failed: " + (err[0].strip() if err else
+                                                      f"exit {r.returncode}")[:300])
 
 
 def checks(cfg):
@@ -600,7 +692,15 @@ def cbmc_base(goto, cfg):
     base = ["cbmc", str(goto), "--function", ENTRY]
     if "unwind" in cfg:
         base += ["--unwind", str(cfg["unwind"])]
+    if cfg.get("object_bits"):
+        # Only raises CBMC's limit on the number of objects; checks nothing less.
+        base += ["--object-bits", str(cfg["object_bits"])]
     return base
+
+
+def cover_base(goto, cfg):
+    """The cbmc command of a --cover run up to (not including) --cover."""
+    return [*cbmc_base(goto, cfg), *MALLOC]
 
 
 def _run(hdir, result, compile_db, include_first=(), timeout=TIMEOUT):
@@ -640,7 +740,8 @@ def _run(hdir, result, compile_db, include_first=(), timeout=TIMEOUT):
             result.detail = f"{len(failed)} failed: " + "; ".join(names[:10])
             return
 
-        _, msgs = _cbmc_json([*base, "--cover", "location", "--json-ui"], cwd, timeout)
+        _, msgs = _cbmc_json([*cover_base(goto, cfg), "--cover", "location", "--json-ui"],
+                             cwd, timeout)
         goals = _section(msgs, "goals")
         if not _harness_end_reached(goals, harness_c, cwd):
             # Contradictory assumptions make every property hold trivially.

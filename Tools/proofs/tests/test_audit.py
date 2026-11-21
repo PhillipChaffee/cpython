@@ -377,6 +377,38 @@ class AuditFixtureTest(unittest.TestCase):
                             edit_c=lambda c: c.replace('"loop.c"\n', '"loop.c"\n#define LIMIT 4\n'))
         self.assertTrue(v.ok, v.problems)
 
+    def test_import_and_angle_includes_cannot_hide_a_define(self):
+        # Ruling: only quoted #include was followed, so #import "pre.h" (or
+        # <pre.h>) could bring a #define in before the source unseen.
+        def run_with(line, header="\n#define s s_renamed\n", name="pre.h"):
+            with tempfile.TemporaryDirectory() as tmp:
+                h = _copy(FIX / "loop_harness_ok", tmp,
+                          edit_c=lambda c: line + c,
+                          edit_toml=lambda t: t.replace('"T2"', '"T1"'))
+                (h / name).write_text(header)
+                return audit.audit(h, out=pathlib.Path(tmp) / "out")
+        v = run_with('#import "pre.h"\n')
+        self.assertFalse(v.ok)
+        self.assertIn('harness.c:1: #import "pre.h": #import and #include_next are not allowed',
+                      " ".join(v.problems))
+        v = run_with('#include_next <stdlib.h>\n')
+        self.assertFalse(v.ok)
+        self.assertIn("harness.c:1: #include_next <stdlib.h>: #import and #include_next",
+                      " ".join(v.problems))
+        # <...> resolves through -I; the harness directory is not on the
+        # path, but models/ is: a model header with a #define counts.
+        with tempfile.TemporaryDirectory() as tmp:
+            models = pathlib.Path(tmp) / "models"
+            models.mkdir()
+            (models / "pre.h").write_text("#pragma once\n#define s s_renamed\n")
+            with unittest.mock.patch.object(run, "MODELS", models):
+                h = _copy(FIX / "loop_harness_ok", tmp, edit_c=lambda c: "#include <pre.h>\n" + c,
+                          edit_toml=lambda t: t.replace('"T2"', '"T1"').replace(
+                              "models = []", 'models = ["pre"]'))
+                v = audit.audit(h, out=pathlib.Path(tmp) / "out")
+        self.assertFalse(v.ok)
+        self.assertIn("models/pre.h:2: #define s before", " ".join(v.problems))
+
     def test_unused_equivalents_reported_below_t2(self):
         entry = '\n[[equivalent_mutants]]\noffset = 0\ndiff = "a ==> b"\nreason = "r"\n'
         v = self.audit_copy(FIX / "loop_harness_ok",
