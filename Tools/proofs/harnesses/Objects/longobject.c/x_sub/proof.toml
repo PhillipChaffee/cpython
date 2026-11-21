@@ -1,0 +1,10 @@
+source = "Objects/longobject.c"
+function = "x_sub"
+tier = "T2"
+unwind = 5
+max_size = 3
+object_bits = 12
+models = ["models", "alloc", "object", "errors", "runtime"]
+contracts = []
+disable_checks = ["--unsigned-overflow-check", "--conversion-check"]
+disable_reason = "the borrow is computed with unsigned digit arithmetic modulo 2**32 on purpose (the source comment says so), which is defined; and _PyLong_CompactValue() (Include/cpython/longintrepr.h) converts 1 - (lv_tag & 3), a size_t, to Py_ssize_t, which for a negative int is out of range: implementation-defined (gcc: modulo 2**64), not undefined; recorded in findings/_PyLong_CompactValue.md"

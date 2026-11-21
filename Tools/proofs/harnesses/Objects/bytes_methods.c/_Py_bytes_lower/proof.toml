@@ -1,0 +1,9 @@
+source = "Objects/bytes_methods.c"
+function = "_Py_bytes_lower"
+tier = "T2"
+unwind = 9
+max_size = 8
+models = []
+contracts = []
+disable_checks = ["--conversion-check"]
+disable_reason = "char <-> unsigned char conversions of bytes >= 128 are implementation-defined, not undefined (gcc: modulo 256); Py_TOLOWER() stores the table value back into a char"

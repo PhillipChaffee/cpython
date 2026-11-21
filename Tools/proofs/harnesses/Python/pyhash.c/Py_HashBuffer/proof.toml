@@ -1,0 +1,9 @@
+source = "Python/pyhash.c"
+function = "Py_HashBuffer"
+tier = "T1"
+unwind = 2
+max_size = 8
+models = []
+contracts = []
+disable_checks = ["--unsigned-overflow-check", "--conversion-check"]
+disable_reason = "SipHash adds uint64_t values modulo 2**64 by design (defined behaviour), and pysiphash() converts the uint64_t result to Py_hash_t, implementation-defined (gcc: modulo 2**64), not undefined"

@@ -1,0 +1,9 @@
+source = "Objects/longobject.c"
+function = "v_lshift"
+tier = "T2"
+unwind = 5
+max_size = 4
+models = []
+contracts = []
+disable_checks = ["--conversion-check"]
+disable_reason = "(digit)acc truncates a twodigits to its low 32 bits on purpose before masking; unsigned narrowing is defined C behaviour (modulo 2**32)"

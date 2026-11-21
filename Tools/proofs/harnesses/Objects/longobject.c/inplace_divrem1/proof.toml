@@ -1,0 +1,9 @@
+source = "Objects/longobject.c"
+function = "inplace_divrem1"
+tier = "T2"
+unwind = 3
+max_size = 2
+models = []
+contracts = []
+disable_checks = []
+disable_reason = ""

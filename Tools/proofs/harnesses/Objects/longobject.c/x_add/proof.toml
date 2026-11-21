@@ -1,0 +1,10 @@
+source = "Objects/longobject.c"
+function = "x_add"
+tier = "T2"
+unwind = 5
+max_size = 3
+object_bits = 12
+models = ["models", "alloc", "object", "errors", "runtime"]
+contracts = []
+disable_checks = []
+disable_reason = ""
