@@ -16,13 +16,14 @@ $SUDO apt-get install -y \
     "bear=${BEAR_VERSION}" \
     "lcov=${LCOV_VERSION}"
 
-if [ "$(pip show universalmutator 2>/dev/null | sed -n 's/^Version: //p')" != "$UNIVERSALMUTATOR_VERSION" ]; then
-    PIP="pip install --break-system-packages"
+if [ "$(python3 -m pip show universalmutator 2>/dev/null | sed -n 's/^Version: //p')" != "$UNIVERSALMUTATOR_VERSION" ]; then
+    PIP="python3 -m pip install --break-system-packages"
     if ! $PIP "universalmutator==${UNIVERSALMUTATOR_VERSION}"; then
         # The obsolete 'typing' backport required by comby fails to build on
         # modern Python; install the dependencies without it.
-        $PIP --no-deps "universalmutator==${UNIVERSALMUTATOR_VERSION}" comby
-        $PIP python-levenshtein tabulate loguru
+        $PIP --no-deps "universalmutator==${UNIVERSALMUTATOR_VERSION}" "comby==${COMBY_VERSION}"
+        $PIP "python-levenshtein==${PYTHON_LEVENSHTEIN_VERSION}" "rapidfuzz==${RAPIDFUZZ_VERSION}" \
+            "tabulate==${TABULATE_VERSION}" "loguru==${LOGURU_VERSION}"
     fi
 fi
 

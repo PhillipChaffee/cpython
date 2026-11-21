@@ -6,4 +6,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p "$ROOT/build/proofs"
 cd "$ROOT/build/proofs"
 ../../configure
+# Bear only records commands that actually run, so start from a clean tree.
+if [ -f Makefile ]; then make clean; fi
 bear -- make -j"$(nproc)"

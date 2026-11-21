@@ -2,6 +2,8 @@
 
 ## Setup
 
+Ubuntu 24.04 is required (`install.sh` uses apt).
+
 From the repository root:
 
 ```sh
