@@ -7,7 +7,8 @@
  * Both pass digit arrays of PyLong objects, whose digits are <= PyLong_MASK,
  * and both rely on m >= n (v_iadd() asserts it; NDEBUG removes the assert).
  * The arrays hold exactly m and n digits, so any read past them is a bounds
- * failure.
+ * failure.  Postcondition (T2): x holds the low m digits of x0 + y0, the
+ * returned carry is the carry out of the top digit, and y is unchanged.
  */
 #include "Objects/longobject.c"
 
@@ -27,12 +28,33 @@ void harness(void)
         __CPROVER_assume(y[i] <= PyLong_MASK);  /* PyLong digit invariant */
     }
 
+    digit *x0 = malloc(m * sizeof(digit));
+    digit *y0 = malloc(n * sizeof(digit));
+    for (Py_ssize_t i = 0; i < m; i++) {
+        x0[i] = x[i];
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        y0[i] = y[i];
+    }
+
     digit carry = v_iadd(x, m, y, n);
 
-    __CPROVER_assert(carry == 0 || carry == 1, "carry is 0 or 1");
+    /* Independent reference: schoolbook addition of y0 (zero-extended to m
+     * digits) into x0.  Digits are < 2**PyLong_SHIFT, so t < 2**(SHIFT+1)
+     * fits in a digit. */
+    digit c = 0;
     for (Py_ssize_t i = 0; i < m; i++) {
-        __CPROVER_assert(x[i] <= PyLong_MASK, "every output digit <= PyLong_MASK");
+        digit t = x0[i] + (i < n ? y0[i] : 0) + c;
+        __CPROVER_assert(x[i] == (t & PyLong_MASK), "x[i] is digit i of x0 + y0");
+        c = t >> PyLong_SHIFT;
     }
+    __CPROVER_assert(carry == c, "returned carry is the carry out of digit m-1");
+    __CPROVER_assert(carry == 0 || carry == 1, "carry is 0 or 1");
+    for (Py_ssize_t i = 0; i < n; i++) {
+        __CPROVER_assert(y[i] == y0[i], "y is unchanged");
+    }
+    free(x0);
+    free(y0);
     free(x);
     free(y);
 }

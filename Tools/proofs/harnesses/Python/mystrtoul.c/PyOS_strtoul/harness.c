@@ -21,10 +21,9 @@ void harness(void)
     char *buf = malloc(len + 1);
     buf[len] = '\0';
 
+    /* Any int: the documented contract is "0 or between 2 and 36", but the
+     * function rejects other bases itself ("catch silly bases"). */
     int base;
-    /* Documented contract above PyOS_strtoul(): "Base must be 0 or between
-     * 2 and 36 (inclusive)". */
-    __CPROVER_assume(base == 0 || (base >= 2 && base <= 36));
 
     char *end;
     int want_end;

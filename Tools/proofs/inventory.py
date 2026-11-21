@@ -129,6 +129,21 @@ def _run(cmd, cwd):
                           errors="replace", timeout=TIMEOUT)
 
 
+def goal_lines(goal, cwd):
+    """{absolute path: {func: set(lines)}} of one cover goal's basicBlockLines.
+
+    CBMC reports paths relative to the directory goto-cc ran in (``cwd``).
+    """
+    out = {}
+    for path, funcs in (goal.get("basicBlockLines") or {}).items():
+        if not os.path.isabs(path):
+            path = os.path.normpath(os.path.join(cwd, path))
+        dst = out.setdefault(path, {})
+        for func, text in funcs.items():
+            dst.setdefault(func, set()).update(parse_lines(text))
+    return out
+
+
 def analyse_unit(source, flags, cwd):
     """Return {abs_path: {func: {"lines": [...], "static": bool}}} for one unit.
 
@@ -162,15 +177,13 @@ def analyse_unit(source, flags, cwd):
                   if s.get("isFileLocal") and s.get("type", {}).get("id") == "code"}
     raw = {}
     for goal in goals:
-        for path, funcs in (goal.get("basicBlockLines") or {}).items():
-            if not os.path.isabs(path):
-                path = os.path.normpath(os.path.join(cwd, path))
-            for func, text in funcs.items():
+        for path, funcs in goal_lines(goal, cwd).items():
+            for func, lines in funcs.items():
                 if func == ENTRY:
                     continue
                 info = raw.setdefault(path, {}).setdefault(
                     func, {"lines": set(), "static": func in static_fns})
-                info["lines"] |= parse_lines(text)
+                info["lines"] |= lines
     return {p: {f: {"lines": sorted(i["lines"]), "static": i["static"]} for f, i in fs.items()}
             for p, fs in raw.items()}
 

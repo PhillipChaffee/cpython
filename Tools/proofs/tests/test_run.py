@@ -5,6 +5,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -71,6 +72,62 @@ class RunFixtureTest(unittest.TestCase):
             r = run.run_harness(h, out=pathlib.Path(tmp) / "out")
             self.assertEqual(r.status, "fail")
             self.assertIn("vacuous", r.detail)
+
+    def test_plain_assert_is_refused(self):
+        # NDEBUG (from the compile database) would compile assert() out
+        r = run.run_harness(FIX / "plain_assert_harness")
+        self.assertEqual(r.status, "error")
+        self.assertIn("assert()", r.detail)
+
+    def test_t2_without_cprover_assert_is_refused(self):
+        r = run.run_harness(FIX / "t2_no_assert_harness")
+        self.assertEqual(r.status, "error")
+        self.assertIn("__CPROVER_assert", r.detail)
+
+    def test_assert_in_comment_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = pathlib.Path(tmp) / "h"
+            shutil.copytree(FIX / "loop_harness_ok", h)
+            c = "/* assert() compiles to nothing */\n// assert(x)\n" + (h / "harness.c").read_text()
+            (h / "harness.c").write_text(c)
+            r = run.run_harness(h, out=pathlib.Path(tmp) / "out")
+            self.assertEqual(r.status, "pass", r.detail)
+
+    def test_disable_checks_must_be_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = pathlib.Path(tmp) / "h"
+            shutil.copytree(FIX / "loop_harness_ok", h)
+            toml = (h / "proof.toml").read_text()
+            toml = toml.replace('disable_checks = []', 'disable_checks = "--conversion-check"')
+            toml = toml.replace('disable_reason = ""', 'disable_reason = "x"')
+            (h / "proof.toml").write_text(toml)
+            r = run.run_harness(h, out=pathlib.Path(tmp) / "out")
+            self.assertEqual(r.status, "error")
+            self.assertIn("list of strings", r.detail)
+
+    def test_stale_build_is_an_error_result(self):
+        def stale():
+            raise run.StaleBuild("rerun Tools/proofs/build_db.sh")
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(run, "_compile_db", stale):
+            r = run.run_harness(FIX / "loop_harness_ok", out=pathlib.Path(tmp))
+        self.assertEqual(r.status, "error")
+        self.assertIn("build_db.sh", r.detail)
+
+    def test_header_lines_resolve_against_compile_directory(self):
+        # goto-cc runs in the entry's directory; CBMC reports the header as
+        # "../inc/inl.h" relative to it, not to the repo root.
+        inline = FIX / "inline"
+        db = {str((inline / "use.c").resolve()): {
+            "directory": str(inline / "objdir"),
+            "file": "../use.c",
+            "arguments": ["cc", "-I../inc", "-c", "../use.c"],
+        }}
+        with tempfile.TemporaryDirectory() as tmp:
+            r = run.run_harness(FIX / "inline_harness", out=pathlib.Path(tmp), compile_db=db)
+        self.assertEqual(r.status, "pass", r.detail)
+        self.assertEqual(r.covered.get("inc/inl.h"), [4, 5])
+        self.assertEqual(r.covered.get("use.c"), [3])
 
     def test_disable_checks_outside_list_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

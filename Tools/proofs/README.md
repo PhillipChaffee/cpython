@@ -56,7 +56,8 @@ A harness is a directory `harnesses/<source>/<function>/` with two files:
   locals (any value), narrows them with `__CPROVER_assume()` only as far as the
   callers guarantee, calls the function and states postconditions with
   `__CPROVER_assert()`. The compile database defines `NDEBUG`, so `assert()`
-  checks nothing.
+  checks nothing: the runner reports `error` for a harness that calls
+  `assert()`, and for a T2/T3 harness with no `__CPROVER_assert()`.
 - `proof.toml`:
 
   ```toml

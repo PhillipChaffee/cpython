@@ -1,0 +1,9 @@
+source = "Tools/proofs/tests/fixtures/inline/use.c"
+function = "quad"
+tier = "T2"
+unwind = 1
+max_size = 0
+models = []
+contracts = []
+disable_checks = []
+disable_reason = ""

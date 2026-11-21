@@ -20,6 +20,7 @@ import functools
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,10 @@ class Result:
     seconds: float = 0.0
     detail: str = ""
     properties_checked: int = 0
+    """Every property (all check kinds, the harness's own assertions too) in a
+    function the proof reached, i.e. one with a satisfied cover goal, plus
+    harness(); properties of functions the harness never reaches are left out.
+    0 unless the status is "pass"."""
 
     def to_json(self):
         return dataclasses.asdict(self)
@@ -118,6 +123,8 @@ def _read_config(hdir):
     if cfg["tier"] != "T3" and not isinstance(cfg.get("unwind"), int):
         raise HarnessError("proof.toml: 'unwind' (int) is required below T3")
     disabled = cfg.get("disable_checks", [])
+    if not isinstance(disabled, list) or not all(isinstance(c, str) for c in disabled):
+        raise HarnessError("proof.toml: disable_checks must be a list of strings")
     bad = [c for c in disabled if c not in DISABLEABLE]
     if bad:
         raise HarnessError(f"proof.toml: cannot disable {bad}; only {list(DISABLEABLE)}")
@@ -158,56 +165,67 @@ def _section(msgs, key):
     raise HarnessError(f"cbmc output has no {key!r}" + (f": {errors[0][:200]}" if errors else ""))
 
 
-def _covered(goals, harness_c, source, root):
+_COMMENT_OR_STRING = re.compile(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.S)
+_PLAIN_ASSERT = re.compile(r"(?<![\w])assert\s*\(")
+
+
+def _check_assertions(harness_c, tier):
+    """Refuse harnesses whose checks would silently vanish."""
+    code = _COMMENT_OR_STRING.sub(" ", harness_c.read_text(errors="replace"))
+    if _PLAIN_ASSERT.search(code):
+        raise HarnessError("harness.c calls assert(), which NDEBUG compiles out; "
+                           "use __CPROVER_assert(cond, \"description\")")
+    if tier in ("T2", "T3") and "__CPROVER_assert" not in code:
+        raise HarnessError(f"tier {tier} needs a postcondition, but harness.c has no __CPROVER_assert")
+
+
+def _covered(goals, harness_c, cwd, root):
     """(covered {rel path: [lines]}, reached function names) from cover goals.
 
-    The harness file and everything else under Tools/proofs/ (models, contracts)
-    is left out of the covered lines; the proved source itself is kept.
+    The harness file and the proof scaffolding (harnesses/, models/,
+    contracts/) are left out of the covered lines.
     """
     raw, reached = {}, set()
     harness_c = os.path.realpath(harness_c)
-    proofs_dir = os.path.realpath(HERE) + os.sep
+    scaffolding = tuple(os.path.realpath(d) + os.sep for d in (HARNESSES, MODELS, CONTRACTS))
     for g in goals:
         if g.get("status") != "satisfied":
             continue
-        for path, funcs in (g.get("basicBlockLines") or {}).items():
-            if not os.path.isabs(path):
-                path = os.path.join(root, path)
+        for path, funcs in inventory.goal_lines(g, cwd).items():
             path = os.path.realpath(path)
             reached.update(funcs)
-            if path == harness_c or (path.startswith(proofs_dir) and path != source):
+            if path == harness_c or path.startswith(scaffolding):
                 continue
             dst = raw.setdefault(path, {})
-            for func, text in funcs.items():
-                dst.setdefault(func, set()).update(inventory.parse_lines(text))
+            for func, lines in funcs.items():
+                dst.setdefault(func, set()).update(lines)
     lines = {p: sorted(set().union(*fs.values()))
              for p, fs in inventory.relativise(raw, root).items()}
     return dict(sorted(lines.items())), reached
 
 
-def _harness_end_reached(goals, harness_c, root):
+def _harness_end_reached(goals, harness_c, cwd):
     """Whether the cover goal holding the last line of harness() is satisfied."""
     harness_c = os.path.realpath(harness_c)
     last, status = -1, None
     for g in goals:
-        for path, funcs in (g.get("basicBlockLines") or {}).items():
-            if not os.path.isabs(path):
-                path = os.path.join(root, path)
+        for path, funcs in inventory.goal_lines(g, cwd).items():
             if os.path.realpath(path) != harness_c or ENTRY not in funcs:
                 continue
-            top = max(inventory.parse_lines(funcs[ENTRY]))
+            top = max(funcs[ENTRY])
             if top > last:
                 last, status = top, g.get("status")
     return status == "satisfied"
 
 
-def run_harness(hdir, out=OUT):
+def run_harness(hdir, out=OUT, compile_db=None):
+    """Run one harness; compile_db ({source path: entry}) defaults to build/proofs."""
     hdir = pathlib.Path(hdir).resolve()
     start = time.monotonic()
     result = Result(status="error", tier="")
     try:
-        _run(hdir, result)
-    except HarnessError as exc:
+        _run(hdir, result, compile_db)
+    except (HarnessError, StaleBuild) as exc:
         result.status, result.detail = "error", str(exc)
     except subprocess.TimeoutExpired as exc:
         result.status, result.detail = "error", f"timeout after {exc.timeout}s"
@@ -222,13 +240,14 @@ def _count_assumes(paths):
     return sum(p.read_text(errors="replace").count("__CPROVER_assume") for p in paths)
 
 
-def _run(hdir, result):
+def _run(hdir, result, compile_db):
     cfg = _read_config(hdir)
     result.tier = cfg["tier"]
     result.stubs = list(cfg.get("models", [])) + list(cfg.get("contracts", []))
     harness_c = hdir / "harness.c"
     if not harness_c.exists():
         raise HarnessError(f"{harness_c} not found")
+    _check_assertions(harness_c, cfg["tier"])
     model_srcs = [MODELS / f"{n}.c" for n in cfg.get("models", [])]
     stubs = _stub_sources(cfg)
     result.assumes = _count_assumes([harness_c, *model_srcs])
@@ -236,7 +255,7 @@ def _run(hdir, result):
     source = (ROOT / cfg["source"]).resolve()
     if not source.exists():
         raise HarnessError(f"source {cfg['source']} not found")
-    entry = _compile_db().get(str(source))
+    entry = (_compile_db() if compile_db is None else compile_db).get(str(source))
     if entry is not None:
         flags, cwd = inventory.entry_flags(entry), entry["directory"]
     else:
@@ -270,12 +289,12 @@ def _run(hdir, result):
 
         _, msgs = _cbmc_json([*base, "--cover", "location", "--json-ui"], cwd)
         goals = _section(msgs, "goals")
-        if not _harness_end_reached(goals, harness_c, root):
+        if not _harness_end_reached(goals, harness_c, cwd):
             # Contradictory assumptions make every property hold trivially.
             result.status = "fail"
             result.detail = "vacuous: the end of harness() is unreachable under its assumptions"
             return
-        result.covered, reached = _covered(goals, harness_c, str(source), root)
+        result.covered, reached = _covered(goals, harness_c, cwd, root)
 
     reached.add(ENTRY)
     result.properties_checked = sum(
