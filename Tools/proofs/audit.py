@@ -11,8 +11,9 @@ Rules (see README.md, "Audit"):
 3. every models/ or contracts/ file the compilation reads is listed in
    proof.toml, the compilation reads no other proof code and no file outside
    the repository except system headers, every assume lies in harness code or
-   a listed model/contract, and every body-less function the proof reaches is
-   listed in ``havoc_callees``;
+   a listed model/contract, harness code sets no macro before the code under
+   proof unless proof.toml lists it in ``predefine``, and every body-less
+   function the proof reaches is listed in ``havoc_callees``;
 4. T2/T3: mutants of the target function's lines must all fail the proof,
    else the harness is demoted to T1 (``equivalent_mutants`` excepted);
 5. T3: no ``unwind`` and a contract-mode run (not implemented yet: demoted).
@@ -159,6 +160,107 @@ def line_directives(files, hdir):
     return out
 
 
+_DIRECTIVE = re.compile(r"[ \t]*(?:#|%:|\?\?=)[ \t]*(define|undef|include_next|include|import|pragma)\b[ \t]*")
+
+
+def _logical_lines(path):
+    """[(first physical line, code, raw)] per logical line of ``path``:
+    backslash-newlines spliced, and in ``code`` comments and literals blanked
+    (same offsets as ``raw``)."""
+    out, buf, start = [], "", None
+    for n, text in enumerate(pathlib.Path(path).read_text(errors="replace").split("\n"), 1):
+        start = start or n
+        if text.endswith("\\") or text.endswith("??/"):
+            buf += text[:-1 if text.endswith("\\") else -3]
+            continue
+        out.append((start, buf + text))
+        buf, start = "", None
+    if buf:
+        out.append((start, buf))
+    code = _strip_comments("\n".join(raw for _, raw in out)).split("\n")
+    return [(n, c, raw) for (n, raw), c in zip(out, code)]
+
+
+def _directives(path, code, stubs, seen):
+    """The preprocessor directives of harness.c in the order the preprocessor
+    meets them, following #include into harness code and stub files:
+    (kind, name, path, line), kind "define" | "undef" | "pragma" | "outside"
+    (an #include of any other file; ``name`` is its operand).  Conditionals are
+    ignored: a directive in a skipped branch counts."""
+    for line, text, raw in _logical_lines(path):
+        if re.search(r"\b_Pragma\b", text):
+            yield "pragma", "_Pragma", path, line
+        m = _DIRECTIVE.match(text)
+        if m is None:
+            continue
+        kind, rest, after = m.group(1), raw[m.end(1):].strip(), text[m.end(1):].strip()
+        if kind in ("define", "undef"):
+            name = re.match(r"\w+", after)
+            yield kind, name.group() if name else "?", path, line
+        elif kind == "pragma":
+            if after.split() != ["once"]:
+                yield "pragma", rest, path, line
+        else:
+            target, quoted = None, re.match(r'"([^"]+)"', rest)
+            if quoted and kind == "include":
+                # The including file's directory is searched first.
+                beside = os.path.realpath(os.path.join(os.path.dirname(path), quoted.group(1)))
+                if beside in code:
+                    target = beside
+                elif not os.path.exists(beside):
+                    for base in (run.MODELS, run.CONTRACTS):
+                        cand = os.path.realpath(os.path.join(base, quoted.group(1)))
+                        if cand in stubs:
+                            target = cand
+                            break
+            if target is None:
+                yield "outside", rest, path, line
+            elif target not in seen:
+                seen.add(target)
+                yield from _directives(target, code, stubs, seen)
+
+
+def predefines(hdir, cfg, code, stubs):
+    """(problems, notes) for macros that harness code sets before the code under proof.
+
+    A #define or #undef in harness code (or a model/contract header it
+    includes) that the preprocessor meets before the last #include of a file
+    outside harness code, models and contracts can change the meaning of that
+    file.  It is refused unless proof.toml lists the macro in ``predefine``
+    (with a ``predefine_reason``).  #pragma (except ``once``) and _Pragma there
+    are always refused.
+    """
+    allowed = cfg.get("predefine", [])
+    if not isinstance(allowed, list) or not all(isinstance(a, str) for a in allowed):
+        raise AuditError("proof.toml: predefine must be a list of strings")
+    problems, used = [], set()
+    if allowed and not str(cfg.get("predefine_reason", "")).strip():
+        problems.append("predefine needs a non-empty predefine_reason")
+    start = os.path.realpath(pathlib.Path(hdir) / "harness.c")
+    labels = {f: os.path.relpath(f, os.path.realpath(hdir)) for f in code}
+    labels.update(stubs)
+    events = list(_directives(start, set(code), stubs, {start}))
+    last = max((n for n, e in enumerate(events) if e[0] == "outside"), default=-1)
+    if last >= 0:
+        _, operand, path, line = events[last]
+        include = f"#include {operand} ({labels[path]}:{line})"
+    for kind, name, path, line in events[:max(last, 0)]:
+        at = f"{labels[path]}:{line}"
+        if kind == "pragma":
+            problems.append(f"{at}: #pragma before {include} can change the code under proof "
+                            f"({name}); move it below that #include")
+        elif kind in ("define", "undef"):
+            if name in allowed:
+                used.add(name)
+            else:
+                problems.append(f"{at}: #{kind} {name} before {include} can change the code under "
+                                f"proof; move it below that #include or list {name} in "
+                                "proof.toml predefine")
+    notes = [f"predefine entry {a!r} matches no #define or #undef before the code under proof"
+             for a in allowed if a not in used]
+    return problems, notes
+
+
 # -- rule 1 ------------------------------------------------------------------
 
 def check_flags(cfg, result):
@@ -182,7 +284,7 @@ def check_flags(cfg, result):
 
 def _cbmc(cmd, cwd, timeout=run.TIMEOUT):
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                       errors="replace", timeout=timeout)
+                       errors="replace", timeout=timeout, env=run.tool_env())
     if r.returncode not in (0, 10):
         tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
         raise AuditError(f"{cmd[0]} exit {r.returncode}: {tail[0][:200]}")
@@ -370,7 +472,7 @@ def generate_mutants(source, lines):
         # cwd=tmp: mutate writes its scratch copy (.tmp_mutant.*) to the cwd.
         r = subprocess.run(["mutate", str(source), "--noCheck", "--lines", "lines.txt",
                             "--mutantDir", "m"], cwd=tmp, capture_output=True,
-                           text=True, errors="replace", timeout=600)
+                           text=True, errors="replace", timeout=600, env=run.tool_env())
         if r.returncode != 0:
             raise AuditError(f"mutate failed: exit {r.returncode}")
         seen, out = set(), []
@@ -598,6 +700,8 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
     files, stub_files = run.proof_files(hdir, cfg, compile_db)
     fatal += line_directives(files, hdir)                               # rule 2
     fatal += foreign_includes(hdir, cfg, compile_db)                    # rule 3
+    predefine_problems, predefine_notes = predefines(hdir, cfg, files, stub_files)
+    fatal += predefine_problems
 
     havoc = cfg.get("havoc_callees", [])
     if not isinstance(havoc, list) or not all(isinstance(h, str) for h in havoc):
@@ -618,7 +722,7 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
         fatal += stub_problems
         listing = run.goto_listing(goto, cwd)
         fns = goto_functions(listing, cwd)
-        v.assumes, stray = run.assumes(listing, cwd, hdir, files, stub_files)
+        v.assumes, stray = run.assumes(listing, cwd, hdir, files, stub_files, cfg["function"])
         fatal += [f"{s}: an assume outside harness code and the listed models and contracts "
                   "(a macro expanded there?)" for s in dict.fromkeys(stray)]
         unreachable, reached = reachability(goto, cfg, cwd, hdir, files, bodyless(goto, cwd, fns))  # rule 2
@@ -628,7 +732,8 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
         fatal.append("reaches body-less functions (CBMC treats their results as arbitrary): "
                      + ", ".join(unlisted) + "; add a model or list them in havoc_callees")
     v.stubs += [f"havoc:{h}" for h in havoc]
-    notes = [f"havoc_callees entry {h!r} is not reached" for h in havoc if h not in reached]
+    notes = predefine_notes + [f"havoc_callees entry {h!r} is not reached"
+                               for h in havoc if h not in reached]
     defined = harness_stubs(fns, hdir, cfg["function"])
     unlisted = [f for f in defined if f not in hstubs]
     if unlisted:

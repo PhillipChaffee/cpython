@@ -241,15 +241,16 @@ class AuditFixtureTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             h = _copy(FIX / "loop_harness_ok", tmp,
                       edit_toml=lambda t: t.replace('"T2"', '"T1"'),
-                      edit_c=lambda c: "#define BOUND(c) __CPROVER_assume(c)\n" + c.replace(
-                          "    __CPROVER_assume(0 <= n && n <= 4);", "    BOUND(0 <= n && n <= 4);"))
+                      edit_c=lambda c: c.replace(
+                          '#include "loop.c"\n', '#include "loop.c"\n#define BOUND(c) __CPROVER_assume(c)\n')
+                      .replace("    __CPROVER_assume(0 <= n && n <= 4);", "    BOUND(0 <= n && n <= 4);"))
             out = pathlib.Path(tmp) / "out"
             r = run.run_harness(h, out=out)
             v = audit.audit(h, out=out)
         self.assertTrue(v.ok, v.problems)
         self.assertEqual(r.assumes, len(v.assumes))
         self.assertEqual(len(v.assumes), 3, v.assumes)
-        self.assertEqual(v.assumes[0], "harness.c:1: __CPROVER_assume(c) "
+        self.assertEqual(v.assumes[0], "harness.c:2: __CPROVER_assume(c) "
                                        "[no ASSUME instruction on this line]")
         self.assertRegex(v.assumes[1], r"^harness\.c:8: BOUND\(0 <= n && n <= 4\); \[ASSUME .*\]$")
         self.assertEqual(v.assumes[2], "harness.c:10: __CPROVER_assume(-1000 <= a[i] && a[i] <= 1000)")
@@ -264,7 +265,7 @@ class AuditFixtureTest(unittest.TestCase):
                    + loc.format(6, 5) + "     1: ASSUME false\n")          # a jump target
         with tempfile.TemporaryDirectory() as tmp:
             src = pathlib.Path(tmp) / "harness.c"
-            src.write_text("\n\na();\nb();\nc();\n")
+            src.write_text("\n\n__CPROVER_assert(0, \"x\"); __CPROVER_assume(0);\nb();\nc();\n")
             got, stray = run.assumes(listing, tmp, tmp, [os.path.realpath(src)], {})
         self.assertEqual(got, ["harness.c:4: b(); [ASSUME x > 1]", "harness.c:5: c(); [ASSUME false]"])
         self.assertEqual(stray, [])
@@ -284,6 +285,97 @@ class AuditFixtureTest(unittest.TestCase):
         self.assertFalse(v.ok)
         self.assertIn("Tools/proofs/tests/fixtures/loop.c:5: an assume outside harness code "
                       "and the listed models and contracts", " ".join(v.problems))
+
+    def test_abort_and_exit_in_harness_code_are_assumptions(self):
+        r = run.run_harness(FIX / "hidden_abort_harness")
+        self.assertEqual(r.status, "pass", r.detail)
+        v = audit.audit(FIX / "hidden_abort_harness")
+        self.assertTrue(v.ok, v.problems)
+        self.assertEqual(v.assumes, [
+            "harness.c:10: if (m > 4) abort(); [CALL abort: does not return]",
+            "harness.c:11: DIE_IF(n < 0 || n > 4); [CALL exit: does not return]",
+            "harness.c:13: __CPROVER_assume(-1000 <= a[i] && a[i] <= 1000)"])
+        self.assertEqual(r.assumes, 3)
+
+    def test_call_that_can_reach_abort_is_an_assumption(self):
+        # require() is neither harness code nor the target, and may not return.
+        # The target's own call of it is behaviour under proof, not an assumption.
+        r = run.run_harness(FIX / "guard_harness")
+        v = audit.audit(FIX / "guard_harness")
+        self.assertTrue(v.ok, v.problems)
+        self.assertEqual(v.assumes, ["harness.c:7: require(v >= 0); "
+                                     "[CALL require: can reach abort]"])
+        self.assertEqual(r.assumes, 1)
+
+    def test_self_loop_fails_the_proof(self):
+        # Without --no-self-loops-to-assumptions cbmc turns "for (;;);" into an
+        # assumption that no listing shows.
+        self.assertIn("--no-self-loops-to-assumptions", run.CHECKS)
+        self.assertNotIn("--no-self-loops-to-assumptions", run.DISABLEABLE)
+        r = run.run_harness(FIX / "self_loop_harness")
+        self.assertEqual(r.status, "fail", r.detail)
+        self.assertIn("unwinding assertion", r.detail)
+        v = audit.audit(FIX / "self_loop_harness")
+        self.assertFalse(v.ok)
+
+    def test_compiler_environment_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shadow = pathlib.Path(tmp) / "shadow"
+            shadow.mkdir()
+            (shadow / "limits.h").write_text("#define SHADOWED 1\n")
+            h = _copy(FIX / "loop_harness_ok", tmp,
+                      edit_toml=lambda t: t.replace('"T2"', '"T1"'),
+                      edit_c=lambda c: c.replace('"loop.c"\n', '"loop.c"\n#include <limits.h>\n'))
+            plain = run.input_hash(h)
+            env = {k: str(shadow) for k in ("CPATH", "C_INCLUDE_PATH", "GCC_EXEC_PREFIX",
+                                            "COMPILER_PATH", "LIBRARY_PATH")}
+            run.system_include_dirs.cache_clear()
+            try:
+                with unittest.mock.patch.dict(os.environ, env):
+                    self.assertNotIn(os.path.realpath(shadow), run.system_include_dirs())
+                    cfg = run._read_config(h)
+                    cmd, cwd, _ = run.goto_cc_command(h, cfg, run.GOTO_PLACEHOLDER)
+                    deps = run._dependencies(cmd, cwd)
+                    self.assertNotIn(os.path.realpath(shadow / "limits.h"), deps)
+                    self.assertEqual(run.input_hash(h), plain)
+                    v = audit.audit(h, out=pathlib.Path(tmp) / "out")
+            finally:
+                run.system_include_dirs.cache_clear()
+        self.assertTrue(v.ok, v.problems)
+
+    def test_define_before_source_include_is_rejected(self):
+        def top(text, extra=""):
+            return dict(edit_c=lambda c: text + c,
+                        edit_toml=lambda t: t.replace('"T2"', '"T1"') + extra)
+        v = self.audit_copy(FIX / "loop_harness_ok", **top("#define LIMIT 4\n"))
+        self.assertFalse(v.ok)
+        self.assertIn('harness.c:1: #define LIMIT before #include "loop.c" (harness.c:2) can change '
+                      "the code under proof; move it below that #include or list LIMIT in "
+                      "proof.toml predefine", v.problems)
+        listed = 'predefine = ["LIMIT"]\npredefine_reason = "test"\n'
+        v = self.audit_copy(FIX / "loop_harness_ok", **top("#define LIMIT 4\n", listed))
+        self.assertTrue(v.ok, v.problems)
+        v = self.audit_copy(FIX / "loop_harness_ok", **top("#define LIMIT 4\n", 'predefine = ["LIMIT"]\n'))
+        self.assertFalse(v.ok)
+        self.assertIn("predefine_reason", " ".join(v.problems))
+        for text, what in (("# undef \\\n NDEBUG\n", "harness.c:1: #undef NDEBUG before"),
+                           ("/* c */ %:define if(x) if (1)\n", "harness.c:1: #define if before"),
+                           ("#pragma pack(1)\n", "harness.c:1: #pragma before"),
+                           ("_Pragma(\"pack(1)\")\n", "harness.c:1: #pragma before")):
+            v = self.audit_copy(FIX / "loop_harness_ok", **top(text))
+            self.assertFalse(v.ok, text)
+            self.assertIn(what, " ".join(v.problems))
+        # In a harness header, included before the source.
+        with tempfile.TemporaryDirectory() as tmp:
+            h = _copy(FIX / "loop_harness_ok", tmp, **top('#include "pre.h"\n'))
+            (h / "pre.h").write_text("\n#define s s_renamed\n")
+            v = audit.audit(h, out=pathlib.Path(tmp) / "out")
+        self.assertFalse(v.ok)
+        self.assertIn("pre.h:2: #define s before", " ".join(v.problems))
+        # Below the last outside #include a macro is harness business.
+        v = self.audit_copy(FIX / "loop_harness_ok", edit_toml=lambda t: t.replace('"T2"', '"T1"'),
+                            edit_c=lambda c: c.replace('"loop.c"\n', '"loop.c"\n#define LIMIT 4\n'))
+        self.assertTrue(v.ok, v.problems)
 
     def test_unused_equivalents_reported_below_t2(self):
         entry = '\n[[equivalent_mutants]]\noffset = 0\ndiff = "a ==> b"\nreason = "r"\n'

@@ -124,9 +124,22 @@ def entry_flags(entry):
     return keep
 
 
+# Environment variables that add include or program search directories to
+# gcc (and so to goto-cc, which preprocesses with gcc), or make it write files.
+COMPILER_ENV = ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH",
+                "GCC_EXEC_PREFIX", "COMPILER_PATH", "LIBRARY_PATH",
+                "DEPENDENCIES_OUTPUT", "SUNPRO_DEPENDENCIES")
+
+
+def tool_env():
+    """The environment for every gcc, goto-cc and cbmc subprocess: os.environ
+    without COMPILER_ENV, so the caller's shell cannot change what is compiled."""
+    return {k: v for k, v in os.environ.items() if k not in COMPILER_ENV}
+
+
 def _run(cmd, cwd):
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                          errors="replace", timeout=TIMEOUT)
+                          errors="replace", timeout=TIMEOUT, env=tool_env())
 
 
 def goal_lines(goal, cwd):
@@ -202,7 +215,8 @@ def relativise(raw, root):
 
 @functools.lru_cache(maxsize=None)
 def cbmc_version():
-    r = subprocess.run(["cbmc", "--version"], capture_output=True, text=True, errors="replace")
+    r = subprocess.run(["cbmc", "--version"], capture_output=True, text=True, errors="replace",
+                       env=tool_env())
     return r.stdout.strip()
 
 

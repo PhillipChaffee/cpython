@@ -77,6 +77,8 @@ A harness is a directory `harnesses/<source>/<function>/` with two files:
   # havoc_reason = "..."            # required with havoc_callees
   # harness_stubs = ["name"]        # functions defined in harness.c that the target reaches
   # harness_stubs_reason = "..."    # required with harness_stubs
+  # predefine = ["NAME"]            # macros harness code may #define/#undef before the source
+  # predefine_reason = "..."        # required with predefine
   # mutants_max = 30                # mutants run for T2/T3
   # [[equivalent_mutants]]          # offset = N, diff = "...", reason = "..."
   ```
@@ -88,6 +90,16 @@ A harness is a directory `harnesses/<source>/<function>/` with two files:
 with the fixed check list, then (on success) `cbmc --cover location` to record the
 covered lines. A harness whose final line is unreachable (contradictory assumptions)
 fails as vacuous. Each result is written to `Tools/proofs/out/<harness>/result.json`.
+The fixed check list includes `--unwinding-assertions` and
+`--no-self-loops-to-assumptions`. Without the second, CBMC turns a loop such as
+`for (;;);` into an assumption that no listing shows; with it, such a loop
+fails its unwinding assertion. Every gcc, goto-cc and cbmc subprocess of the
+runner and the audit gets the caller's environment without `CPATH`,
+`C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`, `OBJC_INCLUDE_PATH`, `GCC_EXEC_PREFIX`,
+`COMPILER_PATH`, `LIBRARY_PATH`, `DEPENDENCIES_OUTPUT` and
+`SUNPRO_DEPENDENCIES`, so those cannot add include directories. The compiler
+flags come only from the compile database; proof.toml has no key that adds a
+flag such as `-D` or `-U`.
 The runner refuses a compile database older than `build/proofs/pyconfig.h` or
 `Makefile`; rerun `build_db.sh` then.
 
@@ -184,6 +196,32 @@ its `input_hash` matches; otherwise it runs the harness again first.
    else makes `ok` false: for example in the source under proof, where a
    harness macro that expands inside the source would put it. The runner
    computes the same list and stores its length as `assumes` in `result.json`.
+
+   A call that does not return cuts a path off just as an assume does, so it is
+   listed too, as `<file>:<line>: <source line> [CALL abort: does not return]`.
+   This covers every `CALL` instruction located in harness code or in a model
+   or contract file (so also one that a harness macro produces) to `abort`,
+   `exit`, `_Exit`, `_exit`, `quick_exit`, `__builtin_trap`, `longjmp` and the
+   other names in `run.NORETURN`, and to any function of CBMC's built-in
+   library whose model contains an assumption. A call from there to another
+   function that can reach one of these is listed as `[CALL f: can reach
+   abort]`. Two kinds of callee are excepted: the function under proof, and
+   functions defined in harness code or in a model or contract file, whose own
+   calls are listed. Calls located in the CPython source are not listed: a
+   `Py_FatalError()` path there is behaviour under proof.
+
+   **Macros before the code under proof.** A `#define` or `#undef` in harness
+   code that the preprocessor meets before the last `#include` of a file
+   outside harness code, `models/` and `contracts/` can change the meaning of
+   that file with no assume at all (`#define if(x) ...`, or a redefined
+   CPython macro). It makes `ok` false, naming the macro, unless proof.toml
+   lists the name in `predefine`, with a `predefine_reason`. The audit follows
+   `#include` into harness code and into model and contract headers, so a
+   macro defined in such a header counts. Conditionals are not evaluated: a
+   directive in a skipped `#if` branch counts too. `#pragma` (except `once`)
+   and `_Pragma` in that region are always refused. A harness header that is
+   included before the source should use `#pragma once`, not a `#define`
+   include guard. An unused `predefine` entry is reported as a note.
 4. **Mutation (T2; T3 once contract mode exists).** universalmutator (`mutate --noCheck --lines`)
    mutates only the target function's lines, as CBMC's source locations give
    them. Each mutant is a full copy of the source file in a temporary tree with

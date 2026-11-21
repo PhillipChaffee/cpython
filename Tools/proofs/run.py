@@ -45,9 +45,13 @@ CHECKS = (
     "--signed-overflow-check", "--unsigned-overflow-check", "--conversion-check",
     "--div-by-zero-check", "--undefined-shift-check", "--float-overflow-check",
     "--nan-check", "--pointer-primitive-check", "--unwinding-assertions",
+    # Else cbmc turns "for (;;);" into an assumption that no listing shows;
+    # with it, such a loop fails its unwinding assertion.
+    "--no-self-loops-to-assumptions",
 )
 DISABLEABLE = ("--unsigned-overflow-check", "--conversion-check")
 TIERS = ("T1", "T2", "T3")
+tool_env = inventory.tool_env
 
 
 class StaleBuild(Exception):
@@ -153,7 +157,7 @@ def _stub_sources(cfg):
 
 def _cbmc_json(cmd, cwd, timeout=TIMEOUT):
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                       errors="replace", timeout=timeout)
+                       errors="replace", timeout=timeout, env=tool_env())
     if r.returncode not in (0, 10):
         tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
         raise HarnessError(f"cbmc exit {r.returncode}: {tail[0][:200]}")
@@ -239,7 +243,7 @@ def _dependencies(cmd, cwd, resolve=True):
     dep = [a for a in cmd if a not in ("-o", GOTO_PLACEHOLDER)]
     dep.insert(1, "-M")
     r = subprocess.run(dep, cwd=cwd, capture_output=True, text=True, errors="replace",
-                       timeout=TIMEOUT)
+                       timeout=TIMEOUT, env=tool_env())
     if r.returncode != 0:
         err = [l for l in r.stderr.splitlines() if "error" in l.lower()] or r.stderr.splitlines()
         raise HarnessError("goto-cc -M failed: " + (err[0].strip() if err else f"exit {r.returncode}")[:300])
@@ -263,7 +267,7 @@ def system_include_dirs():
     try:
         r = subprocess.run(["gcc", "-E", "-Wp,-v", "-xc", os.devnull], capture_output=True,
                            text=True, errors="replace", timeout=60,
-                           env={**os.environ, "LC_ALL": "C"})
+                           env={**tool_env(), "LC_ALL": "C"})
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise HarnessError(f"gcc -E -Wp,-v failed: {exc}") from None
     dirs, listing = [], False
@@ -391,18 +395,29 @@ def goto_listing(goto, cwd, timeout=TIMEOUT):
     body, after cbmc links its library and removes function pointers."""
     cmd = ["cbmc", str(goto), "--function", ENTRY, "--show-goto-functions"]
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                       errors="replace", timeout=timeout)
+                       errors="replace", timeout=timeout, env=tool_env())
     if r.returncode != 0:
         tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
         raise HarnessError(f"cbmc --show-goto-functions exit {r.returncode}: {tail[0][:200]}")
     return r.stdout
 
 
+_FN_HEADER = re.compile(r"^(\S+) /\* \1 \*/$")
 _ASSUME = re.compile(r"\s+((?:[\d, ]+: )?)ASSUME (.*)$")
 _ASSERT = re.compile(r"\s+(?:[\d, ]+: )?ASSERT (.*?)(?: // .*)?$")
+_CALL = re.compile(r"\s+(?:[\d, ]+: )?CALL (?:\S+ := )?([^\s(]+)\(")
 _COMMENT = re.compile(r"\s+// \d+ (.*)$")
 _LOCATION = re.compile(r"file (.+?) line (\d+)(?: function \S+)?$")
 NO_INSTRUCTION = "[no ASSUME instruction on this line]"
+# Functions that do not return, whether or not CBMC has a model for them.  A
+# model that ends in an assumption (abort, exit, _Exit) is also found in the
+# listing itself.
+NORETURN = frozenset((
+    "abort", "exit", "_Exit", "_exit", "quick_exit", "__builtin_trap", "__builtin_abort",
+    "__builtin_exit", "__builtin__Exit", "__builtin_unreachable", "__assert_fail",
+    "__assert_rtn", "_assert", "longjmp", "_longjmp", "siglongjmp", "__longjmp_chk",
+    "__builtin_longjmp", "pthread_exit", "thrd_exit", "__VERIFIER_error",
+))
 
 
 def _source_line(path, line):
@@ -412,21 +427,43 @@ def _source_line(path, line):
         return "?"
 
 
-def assumes(listing, cwd, hdir, code, stubs):
+def _reaches(calls, start, wanted):
+    """The names in ``wanted`` that ``start`` is or can call (sorted)."""
+    seen, todo = {start}, [start]
+    while todo:
+        for callee in calls.get(todo.pop(), ()):
+            if callee not in seen:
+                seen.add(callee)
+                todo.append(callee)
+    return sorted(seen & wanted)
+
+
+def assumes(listing, cwd, hdir, code, stubs, target=None):
     """(assumes, stray): every assumption of the proof, as "<file>:<line>: <text>".
 
-    One entry per ASSUME instruction of the goto program (``listing``) that is
-    located in a source file, so an assume written through a macro counts where
-    the macro is used.  The text is the literal ``__CPROVER_assume(...)`` on that
-    line if there is one, else the source line and the instruction's condition.
-    Literal assumes in harness code (``code``) and stub files (``stubs``) that
-    no instruction is located at (a macro body, say) are listed too, marked.
-    ``stray`` holds "<file>:<line>" for instructions located outside harness
-    code and stub files, or with no location.  Left out: CBMC's built-in
-    library, whose locations name no real file; and an ASSUME that directly
-    follows an ASSERT of the same condition and is no jump target, since that
-    assertion is a property of the proof (CBMC writes ``ASSERT false; ASSUME
-    false`` after the candidates of a call through a function pointer).
+    ``listing`` is goto_listing(); ``code`` is the harness code, ``stubs`` the
+    model and contract files (proof_files), ``target`` the function under proof.
+
+    * One entry per ASSUME instruction located in a source file, so an assume
+      written through a macro counts where the macro is used.  The text is the
+      literal ``__CPROVER_assume(...)`` on that line if there is one, else the
+      source line and the instruction's condition.
+    * One entry per CALL located in harness code or a stub file to a function
+      that does not return: a name in NORETURN, or a function of CBMC's
+      built-in library whose model contains an assumption (abort() is ``ASSUME
+      false``).  Such a call cuts the path off just as an assume does.  The same
+      for a call from there to any other function, except ``target`` and
+      functions defined in harness code or stub files, that can reach one.
+    * Literal assumes in harness code and stub files that no instruction is
+      located at (a macro body, say) are listed too, marked.
+
+    ``stray`` holds "<file>:<line>" for ASSUME instructions located outside
+    harness code and stub files, or with no location.  Left out: assumes of
+    CBMC's built-in library, whose locations name no real file (calls to them
+    are covered above); and an ASSUME that directly follows an ASSERT of the
+    same condition and is no jump target, since that assertion is a property
+    of the proof (CBMC writes ``ASSERT false; ASSUME false`` after the
+    candidates of a call through a function pointer).
     """
     hdir = os.path.realpath(hdir)
     labels = {f: os.path.relpath(f, hdir) for f in code}
@@ -435,35 +472,81 @@ def assumes(listing, cwd, hdir, code, stubs):
     literal = {f: assume_texts(f) for f in labels}
     root = os.path.realpath(ROOT) + os.sep
     entries, stray = [], []
+    calls = {}              # function -> names it calls
+    local = set()           # functions with an instruction in harness code or a stub file
+    assuming = set()        # built-in library functions whose model assumes
+    found = []              # (path, line, callee) for calls located in ``labels``
+    paths = {}
+
+    def where(comment):
+        loc = _LOCATION.match(comment.group(1)) if comment else None
+        if loc is None:
+            return None, 0, False
+        key = loc.group(1)
+        if key not in paths:
+            real = os.path.realpath(os.path.join(cwd, key))
+            paths[key] = (real, not (key.startswith("<") and not os.path.exists(real)))
+        return paths[key][0], int(loc.group(2)), paths[key][1]
+
     lines = listing.splitlines()
+    fn = None
     for i, text in enumerate(lines):
+        if not text.startswith(" "):
+            head = _FN_HEADER.match(text)
+            if head:
+                fn = head.group(1)
+            continue
+        if text.lstrip().startswith("//"):
+            if fn not in local:
+                path, _, real = where(_COMMENT.match(text))
+                if real and path in labels:
+                    local.add(fn)
+            continue
+        call = _CALL.match(text)
+        if call is not None:
+            calls.setdefault(fn, set()).add(call.group(1))
+            path, line, real = where(_COMMENT.match(lines[i - 1]))
+            if real and path in labels:
+                found.append((path, line, call.group(1)))
+            continue
         m = _ASSUME.match(text)
         if m is None:
             continue
-        before = _ASSERT.match(lines[i - 2]) if i >= 2 else None
-        if before is not None and before.group(1) == m.group(2) and not m.group(1):
-            continue
-        comment = _COMMENT.match(lines[i - 1]) if i else None
-        loc = _LOCATION.match(comment.group(1)) if comment else None
-        if loc is None:
-            stray.append("(no source location)")
-            entries.append((len(rank), 0, f"(no source location): [ASSUME {m.group(2)}]"))
-            continue
-        path, line = os.path.realpath(os.path.join(cwd, loc.group(1))), int(loc.group(2))
-        if loc.group(1).startswith("<") and not os.path.exists(path):
-            continue                                    # <builtin-library-...>
+        path, line, real = where(_COMMENT.match(lines[i - 1]))
         hit = next((t for t in literal.get(path, ()) if t[0] == line), None)
         if hit is not None:
             literal[path].remove(hit)
-            text = hit[1]
-        else:
-            text = f"{_source_line(path, line)} [ASSUME {m.group(2)}]"
+        before = _ASSERT.match(lines[i - 2]) if i >= 2 else None
+        if before is not None and before.group(1) == m.group(2) and not m.group(1):
+            continue
+        if path is None:
+            stray.append("(no source location)")
+            entries.append((len(rank), 0, f"(no source location): [ASSUME {m.group(2)}]"))
+            continue
+        if not real:
+            assuming.add(fn)                            # <builtin-library-...>
+            continue
+        shown = hit[1] if hit is not None else f"{_source_line(path, line)} [ASSUME {m.group(2)}]"
         if path in labels:
             label = labels[path]
         else:
             label = os.path.relpath(path, ROOT) if path.startswith(root) else path
             stray.append(f"{label}:{line}")
-        entries.append((rank.get(path, len(rank)), line, f"{label}:{line}: {text}"))
+        entries.append((rank.get(path, len(rank)), line, f"{label}:{line}: {shown}"))
+    noreturn = NORETURN | assuming
+    for path, line, callee in found:
+        if callee in NORETURN:
+            why = f"[CALL {callee}: does not return]"
+        elif callee in assuming:
+            why = f"[CALL {callee}: its CBMC model contains an assumption]"
+        elif callee == target or callee in local:
+            continue        # the code under proof; harness code's own calls are in ``found``
+        else:
+            hits = _reaches(calls, callee, noreturn)
+            if not hits:
+                continue
+            why = f"[CALL {callee}: can reach {', '.join(hits)}]"
+        entries.append((rank[path], line, f"{labels[path]}:{line}: {_source_line(path, line)} {why}"))
     for f, rest in literal.items():
         entries += [(rank[f], line, f"{labels[f]}:{line}: {text} {NO_INSTRUCTION}")
                     for line, text in rest]
@@ -499,7 +582,7 @@ def compile_harness(hdir, cfg, goto, compile_db=None, include_first=(), timeout=
     """
     cmd, cwd, root = goto_cc_command(hdir, cfg, goto, compile_db, include_first)
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                       errors="replace", timeout=timeout)
+                       errors="replace", timeout=timeout, env=tool_env())
     if r.returncode != 0:
         err = [l for l in r.stderr.splitlines() if "error" in l.lower()] or r.stderr.splitlines()
         raise HarnessError("goto-cc failed: " + (err[0].strip() if err else f"exit {r.returncode}")[:300])
@@ -544,7 +627,7 @@ def _run(hdir, result, compile_db, include_first=(), timeout=TIMEOUT):
             result.input_hash = before
             # The same count as the audit's ``assumes`` list.
             listing = goto_listing(goto, cwd, timeout)
-            result.assumes = len(assumes(listing, cwd, hdir, code, stubs)[0])
+            result.assumes = len(assumes(listing, cwd, hdir, code, stubs, cfg["function"])[0])
 
         base = cbmc_base(goto, cfg)
         result.cbmc_flags = [*base[4:], *checks(cfg)]

@@ -1,0 +1,9 @@
+source = "Tools/proofs/tests/fixtures/guard.c"
+function = "clamp"
+tier = "T1"
+unwind = 1
+max_size = 4
+models = []
+contracts = []
+disable_checks = []
+disable_reason = ""
