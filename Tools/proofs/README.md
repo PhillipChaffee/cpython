@@ -58,8 +58,8 @@ A harness is a directory `harnesses/<source>/<function>/` with two files:
   `__CPROVER_assert()`. The compile database defines `NDEBUG`, so `assert()`
   checks nothing: the runner reports `error` for a harness that calls
   `assert()`, and for a T2/T3 harness with no `__CPROVER_assert()`. It checks
-  all harness code (see "Audit"), not only harness.c, and counts the assumes in
-  all of it.
+  all harness code (see "Audit"), not only harness.c. `assumes` in `result.json`
+  is the length of the audit's `assumes` list (see "Audit").
 - `proof.toml`:
 
   ```toml
@@ -68,8 +68,8 @@ A harness is a directory `harnesses/<source>/<function>/` with two files:
   tier = "T1"                       # "T1" | "T2" | "T3"
   unwind = 9                        # required for T1/T2; omit for T3
   max_size = 8
-  models = []                       # Tools/proofs/models/<name>.c, linked in
-  contracts = []                    # Tools/proofs/contracts/<name>.c, linked in
+  models = []                       # Tools/proofs/models/<name>.c, linked in; covers <name>.h too
+  contracts = []                    # Tools/proofs/contracts/<name>.c, linked in; covers <name>.h too
   disable_checks = []               # only "--unsigned-overflow-check", "--conversion-check"
   disable_reason = ""               # required when disable_checks is not empty
   # Audit only (see "Audit"):
@@ -96,8 +96,8 @@ The runner refuses a compile database older than `build/proofs/pyconfig.h` or
 `python3 Tools/proofs/audit.py [--only <glob>] [--jobs N] [--fail-fast]` decides,
 per harness, whether a passing proof can be trusted and which tier it has earned.
 It writes `Tools/proofs/out/<harness>/audit.json` with `ok`, `audited_tier`,
-`problems`, `stubs`, `assumes` (the text of every `__CPROVER_assume`, with its
-file and line), `mutants_total`, `mutants_killed`, `mutants_vacuous`,
+`problems`, `stubs`, `assumes` (every assumption, with its file and line; see
+"Assumes" below), `mutants_total`, `mutants_killed`, `mutants_vacuous`,
 `mutants_error`, `unused_equivalents` and `input_hash`, prints one
 line per harness and exits 1 if any harness is not `ok`. When `ok` is false the
 harness counts for nothing. When `ok` is true, `audited_tier` is the declared
@@ -129,8 +129,13 @@ its `input_hash` matches; otherwise it runs the harness again first.
    checks the second with `cbmc --cover assertion`: an assertion goal that
    cannot be satisfied is an assertion that no input reaches. As a cross-check,
    each literal `__CPROVER_assert(` line in harness code must have a goal.
-3. **Stubs.** Every file under `models/` or `contracts/` that is compiled in
-   (found from the goto binary's symbol table) must be listed in proof.toml.
+3. **Stubs.** Every file under `models/` or `contracts/` that the compilation
+   reads must be listed in proof.toml. The audit takes the files from
+   `goto-cc -M` (so a header that only defines macros counts) and from the goto
+   binary's symbol table. An entry `name` in `models` covers exactly
+   `models/name.c`, which the runner compiles and links, and `models/name.h`,
+   its header. The same holds for `contracts`. Any other file there, including
+   one in a subdirectory, is unlisted and makes `ok` false.
    Every function that the proof reaches but that has no body, even after CBMC
    links its own library, must be listed in `havoc_callees`, with a
    `havoc_reason`. CBMC lets such a function return any value and does nothing
@@ -149,13 +154,36 @@ its `input_hash` matches; otherwise it runs the harness again first.
    A harness's compilation may read only these files (from `goto-cc -M`):
    - harness code (by real path, so a symlink in the harness directory that
      points outside is refused);
-   - `models/` and `contracts/`;
+   - `models/` and `contracts/` (listed, as above);
    - repository files outside `Tools/proofs/`;
-   - files outside the repository.
+   - files under the compiler's system include directories. goto-cc
+     preprocesses with `gcc -E`, so the audit asks gcc for them once:
+     `gcc -E -Wp,-v -xc /dev/null` (`run.system_include_dirs()`).
    For a fixture whose `source` is under `tests/fixtures/`, that source and the
-   files beside it are allowed too. Any other file under `Tools/proofs/`, such
-   as another harness's directory or a shared helper, makes `ok` false, because
-   no rule would check it.
+   files beside it are allowed too. Any other file makes `ok` false, because no
+   rule would check it and, outside the repository, `input_hash` does not cover
+   it: another harness's directory, a shared helper under `Tools/proofs/`, or
+   a file outside the repository such as `/tmp/helper.h`. Every file is judged
+   by its real path. A file reached through the harness directory (also by real
+   path, so a symlinked directory on the way does not hide it) whose target is
+   outside is reported as a symlink.
+
+   **Assumes.** `assumes` has one entry for each `ASSUME` instruction of the
+   goto program (`cbmc --show-goto-functions`) that is located in a source
+   file. So an assume written through a macro is counted on the line that uses
+   the macro. The entry is `<file>:<line>: __CPROVER_assume(...)` when that
+   text is on the line, else `<file>:<line>: <source line> [ASSUME
+   <condition>]`. A literal `__CPROVER_assume(` in harness code or in a model or
+   contract file (`.c` or `.h`) with no instruction on its line, such as the
+   body of a `#define`, is listed too, marked `[no ASSUME instruction on this
+   line]`. Two kinds of `ASSUME` are left out: those of CBMC's built-in
+   library, and one that directly follows an `ASSERT` of the same condition and
+   is not a jump target. The assertion is then a property the proof checks, so
+   the assume adds nothing. CBMC writes `ASSERT false; ASSUME false` this way
+   after the candidates of a call through a function pointer. An `ASSUME` located anywhere
+   else makes `ok` false: for example in the source under proof, where a
+   harness macro that expands inside the source would put it. The runner
+   computes the same list and stores its length as `assumes` in `result.json`.
 4. **Mutation (T2; T3 once contract mode exists).** universalmutator (`mutate --noCheck --lines`)
    mutates only the target function's lines, as CBMC's source locations give
    them. Each mutant is a full copy of the source file in a temporary tree with

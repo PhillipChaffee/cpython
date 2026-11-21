@@ -8,8 +8,11 @@ Rules (see README.md, "Audit"):
 2. not vacuous: the end of ``harness()`` is reachable (run.py's guard) and
    every ``__CPROVER_assert`` in harness.c is reachable (``cbmc --cover
    assertion``);
-3. every model/contract compiled in is listed in proof.toml, and every
-   body-less function the proof reaches is listed in ``havoc_callees``;
+3. every models/ or contracts/ file the compilation reads is listed in
+   proof.toml, the compilation reads no other proof code and no file outside
+   the repository except system headers, every assume lies in harness code or
+   a listed model/contract, and every body-less function the proof reaches is
+   listed in ``havoc_callees``;
 4. T2/T3: mutants of the target function's lines must all fail the proof,
    else the harness is demoted to T1 (``equivalent_mutants`` excepted);
 5. T3: no ``unwind`` and a contract-mode run (not implemented yet: demoted).
@@ -66,24 +69,7 @@ class AuditError(Exception):
 
 # -- source text helpers ---------------------------------------------------
 
-def _strip_comments(text):
-    """Blank out comments and string/char literals, keeping every newline."""
-    return run._COMMENT_OR_STRING.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
-
-
-def assume_texts(path, label):
-    """["<label>:<line>: __CPROVER_assume(...)"] for every assume in ``path``."""
-    raw = pathlib.Path(path).read_text(errors="replace")
-    code = _strip_comments(raw)
-    out = []
-    for m in re.finditer(r"__CPROVER_assume\s*\(", code):
-        depth, i = 1, m.end()
-        while i < len(code) and depth:
-            depth += {"(": 1, ")": -1}.get(code[i], 0)
-            i += 1
-        text = " ".join(raw[m.start():i].split())
-        out.append(f"{label}:{code.count(chr(10), 0, m.start()) + 1}: {text}")
-    return out
+_strip_comments = run.strip_comments
 
 
 def assert_lines(path):
@@ -100,30 +86,47 @@ def _in_dir(path, hdir):
     return run.inside(path, hdir)
 
 
-harness_files = run.harness_files
+def _below(raw, directory, cache):
+    """The part of ``raw`` (an absolute path, symlinks left in place) below
+    ``directory``, if one of its parent directories is ``directory`` by real
+    path; else None.  So a symlinked component on the way cannot hide it."""
+    directory = os.path.realpath(directory)
+    parent = os.path.dirname(raw)
+    while True:
+        if parent not in cache:
+            cache[parent] = os.path.realpath(parent)
+        if cache[parent] == directory:
+            return os.path.relpath(raw, parent)
+        if parent == os.path.dirname(parent):
+            return None
+        parent = os.path.dirname(parent)
 
 
 def foreign_includes(hdir, cfg, compile_db=None):
     """Problems for files the harness's compilation reads that no rule governs.
 
-    Allowed: harness code (real path inside the harness directory), models and
-    contracts (rule 3), repository files outside Tools/proofs/ and files outside
-    the repository.  For a fixture source under tests/fixtures/, that source and
-    the files directly beside it are allowed too.  Anything else under
-    Tools/proofs/ (another harness, a shared helper) is refused, as is a symlink
-    in the harness directory whose target lies outside it.
+    Each file of ``goto-cc -M`` is judged by its real path.  Allowed: harness
+    code (inside the harness directory), models and contracts (rule 3 checks
+    that they are listed), repository files outside Tools/proofs/, and files
+    under the compiler's system include directories (run.system_include_dirs).
+    For a fixture source under tests/fixtures/, that source and the files
+    directly beside it are allowed too.  Refused: anything else under
+    Tools/proofs/ (another harness, a shared helper), any other file outside
+    the repository, and a symlink in the harness directory whose target lies
+    outside it.
     """
     cmd, cwd, _ = run.goto_cc_command(hdir, cfg, run.GOTO_PLACEHOLDER, compile_db)
-    hdir_s = str(hdir) + os.sep
     source = os.path.realpath(ROOT / cfg["source"])
     fixture_source = run.inside(source, HERE / "tests" / "fixtures")
-    problems = []
+    system = run.system_include_dirs()
+    problems, cache = [], {}
     for raw in sorted(run._dependencies(cmd, cwd, resolve=False)):
         real = os.path.realpath(raw)
         if run.inside(real, hdir):
             continue
-        if raw.startswith(hdir_s):
-            problems.append(f"{os.path.relpath(raw, hdir)} is a symlink to {real}, outside "
+        rel = _below(raw, hdir, cache)
+        if rel is not None:
+            problems.append(f"{rel} is a symlink to {real}, outside "
                             "the harness directory; copy the helper in instead")
         elif run.inside(real, run.MODELS) or run.inside(real, run.CONTRACTS):
             continue
@@ -132,6 +135,11 @@ def foreign_includes(hdir, cfg, compile_db=None):
                 continue
             problems.append(f"includes {os.path.relpath(real, ROOT)}, proof code outside "
                             "the harness directory that no audit rule checks")
+        elif run.inside(real, ROOT) or any(run.inside(real, d) for d in system):
+            continue
+        else:
+            problems.append(f"includes {real}, outside the repository and the compiler's "
+                            "system include directories (" + ", ".join(system) + ")")
     return problems
 
 
@@ -192,12 +200,11 @@ class Function:
     calls: set          # names it calls directly (cbmc has resolved function pointers)
 
 
-def goto_functions(goto, cwd):
-    """{name: Function} for every function with a body, after cbmc links its
-    library and replaces calls through function pointers by direct calls.
-    (The JSON listing drops the location of some instructions, such as IF, so
-    the text listing is parsed.)"""
-    out = _cbmc(["cbmc", str(goto), "--function", run.ENTRY, "--show-goto-functions"], cwd)
+def goto_functions(out, cwd):
+    """{name: Function} for every function with a body in ``out``, the text of
+    run.goto_listing(): cbmc has linked its library and replaced calls through
+    function pointers by direct calls.  (The JSON listing drops the location of
+    some instructions, such as IF, so the text listing is parsed.)"""
     heads = list(_FN_HEADER.finditer(out))
     fns = {}
     for h, nxt in zip(heads, heads[1:] + [None]):
@@ -254,7 +261,13 @@ def symbol_files(goto, cwd):
 
 
 def check_stub_files(cfg, files):
-    """(stub labels, problems) for model/contract files compiled into the harness."""
+    """(stub labels, problems) for model/contract files compiled into the harness.
+
+    ``files``: real paths of every file the compilation reads (``goto-cc -M``)
+    or a symbol was declared in.  A proof.toml entry ``name`` covers exactly
+    ``<kind>/name.c`` (compiled by the runner) and ``<kind>/name.h`` (its
+    header); any other file under models/ or contracts/ is unlisted.
+    """
     listed, problems = [], []
     for kind, base in (("models", run.MODELS), ("contracts", run.CONTRACTS)):
         names = list(cfg.get(kind, []))
@@ -264,7 +277,8 @@ def check_stub_files(cfg, files):
             if not f.startswith(base):
                 continue
             p = pathlib.Path(f)
-            if p.stem not in names or p.suffix not in (".c", ".h"):
+            if (p.stem not in names or p.suffix not in (".c", ".h")
+                    or str(p.parent) + os.sep != base):
                 problems.append(f"unlisted {kind[:-1]} {kind}/{p.relative_to(base)} is compiled in; "
                                 f"list it in proof.toml {kind}")
     return listed, problems
@@ -581,12 +595,9 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
         raise AuditError(f"proof did not pass ({result.status}): {result.detail}")
 
     fatal = check_flags(cfg, result)                                    # rule 1
-    files = harness_files(hdir, cfg, compile_db)
+    files, stub_files = run.proof_files(hdir, cfg, compile_db)
     fatal += line_directives(files, hdir)                               # rule 2
     fatal += foreign_includes(hdir, cfg, compile_db)                    # rule 3
-    v.assumes = [a for f in files for a in assume_texts(f, os.path.relpath(f, hdir))]
-    for n in cfg.get("models", []):
-        v.assumes += assume_texts(run.MODELS / f"{n}.c", f"models/{n}.c")
 
     havoc = cfg.get("havoc_callees", [])
     if not isinstance(havoc, list) or not all(isinstance(h, str) for h in havoc):
@@ -602,9 +613,14 @@ def _audit(hdir, v, out, jobs, fail_fast, compile_db):
     with tempfile.TemporaryDirectory() as tmp:
         goto = pathlib.Path(tmp) / "harness.goto"
         cwd, _ = run.compile_harness(hdir, cfg, goto, compile_db)
-        v.stubs, stub_problems = check_stub_files(cfg, symbol_files(goto, cwd))   # rule 3
+        v.stubs, stub_problems = check_stub_files(                      # rule 3
+            cfg, symbol_files(goto, cwd) | set(stub_files))
         fatal += stub_problems
-        fns = goto_functions(goto, cwd)
+        listing = run.goto_listing(goto, cwd)
+        fns = goto_functions(listing, cwd)
+        v.assumes, stray = run.assumes(listing, cwd, hdir, files, stub_files)
+        fatal += [f"{s}: an assume outside harness code and the listed models and contracts "
+                  "(a macro expanded there?)" for s in dict.fromkeys(stray)]
         unreachable, reached = reachability(goto, cfg, cwd, hdir, files, bodyless(goto, cwd, fns))  # rule 2
     fatal += unreachable
     unlisted = [f for f in reached if f not in havoc]

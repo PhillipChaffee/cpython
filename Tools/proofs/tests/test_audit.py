@@ -179,6 +179,112 @@ class AuditFixtureTest(unittest.TestCase):
         self.assertEqual(r.status, "error")
         self.assertIn("bound.h calls assert()", r.detail)
 
+    def test_macro_only_model_header_must_be_listed(self):
+        # sneaky.h declares no symbol, so the symbol table never shows it.
+        with unittest.mock.patch.object(run, "MODELS", FIX / "fixture_models"):
+            v = audit.audit(FIX / "macro_model_harness")
+        self.assertFalse(v.ok)
+        self.assertIn("unlisted model models/sneaky.h is compiled in; "
+                      "list it in proof.toml models", v.problems)
+
+    def test_listed_model_header_assumes_are_collected(self):
+        with unittest.mock.patch.object(run, "MODELS", FIX / "fixture_models"), \
+                tempfile.TemporaryDirectory() as tmp:
+            h = _copy(FIX / "unlisted_model_harness", tmp,
+                      edit_toml=lambda t: t.replace("models = []", 'models = ["fake_model"]'),
+                      edit_c=lambda c: c.replace('#include "fake_model.c"', '#include "fake_model.h"')
+                      .replace("    int s =", "    FAKE_BOUND(n);\n    int s ="))
+            out = pathlib.Path(tmp) / "out"
+            r = run.run_harness(h, out=out)
+            v = audit.audit(h, out=out)
+        self.assertTrue(v.ok, v.problems)
+        self.assertEqual(r.assumes, len(v.assumes))
+        self.assertIn("models/fake_model.h:2: __CPROVER_assume((n) <= 4) "
+                      "[no ASSUME instruction on this line]", v.assumes)
+        self.assertTrue([a for a in v.assumes if a.startswith("harness.c:10: FAKE_BOUND(n); [ASSUME ")],
+                        v.assumes)
+
+    def test_file_outside_repository_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = pathlib.Path(tmp) / "helper.h"
+            outside.write_text("#define HELPER 1\n")
+            h = _copy(FIX / "loop_harness_ok", tmp,
+                      edit_c=lambda c: f'#include "{outside}"\n' + c)
+            v = audit.audit(h, out=pathlib.Path(tmp) / "out")
+        self.assertFalse(v.ok)
+        self.assertIn(f"includes {os.path.realpath(outside)}, outside the repository and the "
+                      "compiler's system include directories", " ".join(v.problems))
+
+    def test_system_headers_are_allowed(self):
+        v = self.audit_copy(FIX / "loop_harness_ok",
+                            edit_toml=lambda t: t.replace('"T2"', '"T1"'),
+                            edit_c=lambda c: "#include <stddef.h>\n#include <limits.h>\n" + c)
+        self.assertTrue(v.ok, v.problems)
+        dirs = run.system_include_dirs()
+        self.assertTrue(dirs)
+        self.assertTrue(any(os.path.exists(os.path.join(d, "limits.h")) for d in dirs), dirs)
+
+    def test_symlink_reached_through_another_path_is_rejected(self):
+        # check.h is named through a symlinked directory and points at a
+        # repository file: only real paths show that it sits in the harness directory.
+        with tempfile.TemporaryDirectory() as tmp:
+            link = pathlib.Path(tmp) / "link"
+            h = _copy(FIX / "loop_harness_ok", tmp,
+                      edit_c=lambda c: f'#include "{link}/loop_harness_ok/check.h"\n' + c)
+            os.symlink(tmp, link)
+            os.symlink(ROOT / "Include/patchlevel.h", h / "check.h")
+            v = audit.audit(h, out=pathlib.Path(tmp) / "out")
+        self.assertFalse(v.ok)
+        self.assertIn("check.h is a symlink to", " ".join(v.problems))
+
+    def test_macro_wrapped_assume_is_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = _copy(FIX / "loop_harness_ok", tmp,
+                      edit_toml=lambda t: t.replace('"T2"', '"T1"'),
+                      edit_c=lambda c: "#define BOUND(c) __CPROVER_assume(c)\n" + c.replace(
+                          "    __CPROVER_assume(0 <= n && n <= 4);", "    BOUND(0 <= n && n <= 4);"))
+            out = pathlib.Path(tmp) / "out"
+            r = run.run_harness(h, out=out)
+            v = audit.audit(h, out=out)
+        self.assertTrue(v.ok, v.problems)
+        self.assertEqual(r.assumes, len(v.assumes))
+        self.assertEqual(len(v.assumes), 3, v.assumes)
+        self.assertEqual(v.assumes[0], "harness.c:1: __CPROVER_assume(c) "
+                                       "[no ASSUME instruction on this line]")
+        self.assertRegex(v.assumes[1], r"^harness\.c:8: BOUND\(0 <= n && n <= 4\); \[ASSUME .*\]$")
+        self.assertEqual(v.assumes[2], "harness.c:10: __CPROVER_assume(-1000 <= a[i] && a[i] <= 1000)")
+
+    def test_assume_implied_by_an_assertion_is_not_listed(self):
+        loc = "        // {} file harness.c line {} function harness\n"
+        listing = (loc.format(1, 3) + "        ASSERT false // no candidate\n"
+                   + loc.format(2, 3) + "        ASSUME false\n"           # implied: left out
+                   + loc.format(3, 4) + "        ASSERT x > 0 // weaker\n"
+                   + loc.format(4, 4) + "        ASSUME x > 1\n"           # another condition
+                   + loc.format(5, 5) + "        ASSERT false // skipped by a jump\n"
+                   + loc.format(6, 5) + "     1: ASSUME false\n")          # a jump target
+        with tempfile.TemporaryDirectory() as tmp:
+            src = pathlib.Path(tmp) / "harness.c"
+            src.write_text("\n\na();\nb();\nc();\n")
+            got, stray = run.assumes(listing, tmp, tmp, [os.path.realpath(src)], {})
+        self.assertEqual(got, ["harness.c:4: b(); [ASSUME x > 1]", "harness.c:5: c(); [ASSUME false]"])
+        self.assertEqual(stray, [])
+
+    def test_assume_injected_into_source_is_rejected(self):
+        # A harness macro that expands inside the source puts the assume there.
+        inject = ("#define return __CPROVER_assume(s == 0); return\n"
+                  '#include "loop.c"\n#undef return\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            h = _copy(FIX / "loop_harness_ok", tmp,
+                      edit_toml=lambda t: t.replace('"T2"', '"T1"'),
+                      edit_c=lambda c: c.replace('#include "loop.c"\n', inject))
+            out = pathlib.Path(tmp) / "out"
+            r = run.run_harness(h, out=out)
+            v = audit.audit(h, out=out)
+        self.assertEqual(r.assumes, len(v.assumes))
+        self.assertFalse(v.ok)
+        self.assertIn("Tools/proofs/tests/fixtures/loop.c:5: an assume outside harness code "
+                      "and the listed models and contracts", " ".join(v.problems))
+
     def test_unused_equivalents_reported_below_t2(self):
         entry = '\n[[equivalent_mutants]]\noffset = 0\ndiff = "a ==> b"\nreason = "r"\n'
         v = self.audit_copy(FIX / "loop_harness_ok",

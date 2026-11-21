@@ -64,6 +64,8 @@ class Result:
     tier: str
     covered: dict = dataclasses.field(default_factory=dict)   # path -> [line]
     assumes: int = 0
+    """Number of assumptions, counted as the audit lists them (see assumes());
+    0 for a run against substituted sources or one that failed to compile."""
     stubs: list = dataclasses.field(default_factory=list)
     seconds: float = 0.0
     detail: str = ""
@@ -251,14 +253,57 @@ def inside(path, directory):
     return os.path.realpath(path).startswith(os.path.realpath(directory) + os.sep)
 
 
-def harness_files(hdir, cfg, compile_db=None):
-    """Harness code: harness.c and every file it includes from the harness
-    directory, by real path (``goto-cc -M`` with the run's flags), sorted.
-    A symlink in the directory whose target lies outside is not harness code."""
+@functools.cache
+def system_include_dirs():
+    """The compiler's own #include search directories, as real paths.
+
+    goto-cc preprocesses with ``gcc -E``, so gcc is asked: ``gcc -E -Wp,-v -xc
+    /dev/null`` prints the search list on stderr.
+    """
+    try:
+        r = subprocess.run(["gcc", "-E", "-Wp,-v", "-xc", os.devnull], capture_output=True,
+                           text=True, errors="replace", timeout=60,
+                           env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HarnessError(f"gcc -E -Wp,-v failed: {exc}") from None
+    dirs, listing = [], False
+    for line in r.stderr.splitlines():
+        if line.startswith("#include ") and line.endswith("search starts here:"):
+            listing = True
+        elif line.startswith("End of search list"):
+            listing = False
+        elif listing and line.startswith(" "):
+            dirs.append(os.path.realpath(line.strip()))
+    if r.returncode != 0 or not dirs:
+        raise HarnessError("gcc -E -Wp,-v printed no #include search list")
+    return tuple(dict.fromkeys(dirs))
+
+
+def proof_files(hdir, cfg, compile_db=None):
+    """(harness code, stub files) among the files the harness's compilation
+    reads (``goto-cc -M`` with the run's flags), by real path.
+
+    Harness code: harness.c and every file it includes from the harness
+    directory, sorted.  A symlink in the directory whose target lies outside is
+    not harness code.  Stub files: {path: "models/<file>" or "contracts/<file>"}
+    for every file read from models/ or contracts/, listed in proof.toml or not.
+    """
     cmd, cwd, _ = goto_cc_command(hdir, cfg, GOTO_PLACEHOLDER, compile_db)
-    files = {os.path.realpath(pathlib.Path(hdir) / "harness.c")}
-    files |= {f for f in _dependencies(cmd, cwd) if inside(f, hdir)}
-    return sorted(files)
+    deps = _dependencies(cmd, cwd)
+    code = {os.path.realpath(pathlib.Path(hdir) / "harness.c")}
+    code |= {f for f in deps if inside(f, hdir)}
+    stubs = {}
+    for kind, base in (("models", MODELS), ("contracts", CONTRACTS)):
+        base = os.path.realpath(base)
+        for f in sorted(deps | set(map(os.path.realpath, _stub_sources(cfg)))):
+            if f.startswith(base + os.sep) and f not in code:
+                stubs[f] = f"{kind}/{os.path.relpath(f, base)}"
+    return sorted(code), stubs
+
+
+def harness_files(hdir, cfg, compile_db=None):
+    """Harness code (see proof_files)."""
+    return proof_files(hdir, cfg, compile_db)[0]
 
 
 def input_hash(hdir, *, compile_db=None):
@@ -322,8 +367,108 @@ def run_harness(hdir, out=OUT, compile_db=None, include_first=(), timeout=TIMEOU
     return result
 
 
-def _count_assumes(paths):
-    return sum(p.read_text(errors="replace").count("__CPROVER_assume") for p in paths)
+def strip_comments(text):
+    """Blank out comments and string/char literals, keeping every newline."""
+    return _COMMENT_OR_STRING.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
+
+
+def assume_texts(path):
+    """[(line, "__CPROVER_assume(...)")] for every literal assume in ``path``."""
+    raw = pathlib.Path(path).read_text(errors="replace")
+    code = strip_comments(raw)
+    out = []
+    for m in re.finditer(r"__CPROVER_assume\s*\(", code):
+        depth, i = 1, m.end()
+        while i < len(code) and depth:
+            depth += {"(": 1, ")": -1}.get(code[i], 0)
+            i += 1
+        out.append((code.count("\n", 0, m.start()) + 1, " ".join(raw[m.start():i].split())))
+    return out
+
+
+def goto_listing(goto, cwd, timeout=TIMEOUT):
+    """``cbmc --show-goto-functions`` of the harness: every function with a
+    body, after cbmc links its library and removes function pointers."""
+    cmd = ["cbmc", str(goto), "--function", ENTRY, "--show-goto-functions"]
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                       errors="replace", timeout=timeout)
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
+        raise HarnessError(f"cbmc --show-goto-functions exit {r.returncode}: {tail[0][:200]}")
+    return r.stdout
+
+
+_ASSUME = re.compile(r"\s+((?:[\d, ]+: )?)ASSUME (.*)$")
+_ASSERT = re.compile(r"\s+(?:[\d, ]+: )?ASSERT (.*?)(?: // .*)?$")
+_COMMENT = re.compile(r"\s+// \d+ (.*)$")
+_LOCATION = re.compile(r"file (.+?) line (\d+)(?: function \S+)?$")
+NO_INSTRUCTION = "[no ASSUME instruction on this line]"
+
+
+def _source_line(path, line):
+    try:
+        return " ".join(pathlib.Path(path).read_text(errors="replace").splitlines()[line - 1].split())
+    except (OSError, IndexError):
+        return "?"
+
+
+def assumes(listing, cwd, hdir, code, stubs):
+    """(assumes, stray): every assumption of the proof, as "<file>:<line>: <text>".
+
+    One entry per ASSUME instruction of the goto program (``listing``) that is
+    located in a source file, so an assume written through a macro counts where
+    the macro is used.  The text is the literal ``__CPROVER_assume(...)`` on that
+    line if there is one, else the source line and the instruction's condition.
+    Literal assumes in harness code (``code``) and stub files (``stubs``) that
+    no instruction is located at (a macro body, say) are listed too, marked.
+    ``stray`` holds "<file>:<line>" for instructions located outside harness
+    code and stub files, or with no location.  Left out: CBMC's built-in
+    library, whose locations name no real file; and an ASSUME that directly
+    follows an ASSERT of the same condition and is no jump target, since that
+    assertion is a property of the proof (CBMC writes ``ASSERT false; ASSUME
+    false`` after the candidates of a call through a function pointer).
+    """
+    hdir = os.path.realpath(hdir)
+    labels = {f: os.path.relpath(f, hdir) for f in code}
+    labels.update(stubs)
+    rank = {f: n for n, f in enumerate(labels)}
+    literal = {f: assume_texts(f) for f in labels}
+    root = os.path.realpath(ROOT) + os.sep
+    entries, stray = [], []
+    lines = listing.splitlines()
+    for i, text in enumerate(lines):
+        m = _ASSUME.match(text)
+        if m is None:
+            continue
+        before = _ASSERT.match(lines[i - 2]) if i >= 2 else None
+        if before is not None and before.group(1) == m.group(2) and not m.group(1):
+            continue
+        comment = _COMMENT.match(lines[i - 1]) if i else None
+        loc = _LOCATION.match(comment.group(1)) if comment else None
+        if loc is None:
+            stray.append("(no source location)")
+            entries.append((len(rank), 0, f"(no source location): [ASSUME {m.group(2)}]"))
+            continue
+        path, line = os.path.realpath(os.path.join(cwd, loc.group(1))), int(loc.group(2))
+        if loc.group(1).startswith("<") and not os.path.exists(path):
+            continue                                    # <builtin-library-...>
+        hit = next((t for t in literal.get(path, ()) if t[0] == line), None)
+        if hit is not None:
+            literal[path].remove(hit)
+            text = hit[1]
+        else:
+            text = f"{_source_line(path, line)} [ASSUME {m.group(2)}]"
+        if path in labels:
+            label = labels[path]
+        else:
+            label = os.path.relpath(path, ROOT) if path.startswith(root) else path
+            stray.append(f"{label}:{line}")
+        entries.append((rank.get(path, len(rank)), line, f"{label}:{line}: {text}"))
+    for f, rest in literal.items():
+        entries += [(rank[f], line, f"{labels[f]}:{line}: {text} {NO_INSTRUCTION}")
+                    for line, text in rest]
+    entries.sort(key=lambda e: e[:2])
+    return [e[2] for e in entries], stray
 
 
 def goto_cc_command(hdir, cfg, goto, compile_db=None, include_first=()):
@@ -382,10 +527,8 @@ def _run(hdir, result, compile_db, include_first=(), timeout=TIMEOUT):
     harness_c = hdir / "harness.c"
     if not harness_c.exists():
         raise HarnessError(f"{harness_c} not found")
-    code = harness_files(hdir, cfg, compile_db)
+    code, stubs = proof_files(hdir, cfg, compile_db)
     _check_assertions(code, cfg["tier"], hdir)
-    model_srcs = [MODELS / f"{n}.c" for n in cfg.get("models", [])]
-    result.assumes = _count_assumes([*map(pathlib.Path, code), *model_srcs])
 
     # A run against substituted sources (include_first) is not a run of the
     # harness's recorded inputs, so it carries no input hash.  Otherwise the
@@ -399,6 +542,9 @@ def _run(hdir, result, compile_db, include_first=(), timeout=TIMEOUT):
             if input_hash(hdir, compile_db=compile_db) != before:
                 raise HarnessError("inputs changed during run")
             result.input_hash = before
+            # The same count as the audit's ``assumes`` list.
+            listing = goto_listing(goto, cwd, timeout)
+            result.assumes = len(assumes(listing, cwd, hdir, code, stubs)[0])
 
         base = cbmc_base(goto, cfg)
         result.cbmc_flags = [*base[4:], *checks(cfg)]
