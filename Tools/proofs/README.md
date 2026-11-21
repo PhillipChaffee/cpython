@@ -23,8 +23,13 @@ Files matching `exclude` in `scope.toml` (vendored, other-platform, JIT, test an
 demo code) are skipped. Per-file results are cached in `Tools/proofs/out/cache/`.
 
 ```sh
-python3 Tools/proofs/inventory.py --out Tools/proofs/out/inventory.json [--jobs N]
+python3 Tools/proofs/inventory.py --out Tools/proofs/out/inventory.json [--jobs N] [--no-cache] [--allow-errors]
 ```
+
+Only successful per-file results are cached (errors are retried every run). The
+cache key is the source path, its mtime and size, the flags and the `cbmc
+--version` string; it does not track headers, so after editing a header run with
+`--no-cache` (or delete `Tools/proofs/out/cache/`).
 
 Totals on this tree (4 cores, about 5.5 minutes cold, under a second cached):
 
@@ -32,10 +37,15 @@ Totals on this tree (4 cores, about 5.5 minutes cold, under a second cached):
 |------:|----------:|------:|-------:|
 | 499   | 15846     | 254223 | 17    |
 
-The 17 errors are recorded under `"errors"` in the JSON: 14 files fail in `goto-cc`
-on glibc's `readdir64` (`_posixsubprocess`, `_remote_debugging/*`, `posixmodule`,
-`remote_debugging`), `Python/pystrhex.c` fails on `__builtin_shufflevector`, and
-`Modules/mathmodule.c` hits a `goto-cc` invariant violation. They are not in the totals.
+The command exits 1 when any file could not be analysed, unless `--allow-errors`
+is given. **The 17 files that failed are not in the denominator.** Any coverage
+percentage computed from it must list them as "size unknown, uncovered" until they
+are resolved or explicitly waived. They are recorded under `"errors"` in the JSON:
+14 files fail in `goto-cc` on glibc's `readdir64` (`_posixsubprocess`,
+`_remote_debugging/*`, `posixmodule`, `remote_debugging`; `_FILE_OFFSET_BITS=64`
+from `pyconfig.h` redirects `readdir`, and no command-line flag overrides the
+`__REDIRECT` handling), `Python/pystrhex.c` fails on `__builtin_shufflevector`, and
+`Modules/mathmodule.c` hits a `goto-cc` invariant violation.
 
 ## Harnesses
 

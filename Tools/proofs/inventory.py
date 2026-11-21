@@ -10,6 +10,7 @@ lines of every function in the unit (reachable from the entry or not).
 import argparse
 import concurrent.futures
 import fnmatch
+import functools
 import hashlib
 import json
 import os
@@ -180,36 +181,43 @@ def relativise(raw, root):
     root = os.path.realpath(root)
     for path, funcs in raw.items():
         rel = os.path.relpath(os.path.realpath(path), root)
-        if rel.startswith("..") or rel == "build" or rel.startswith("build" + os.sep):
+        if rel == ".." or rel.startswith(".." + os.sep) or rel == "build" or rel.startswith("build" + os.sep):
             continue
         out[rel.replace(os.sep, "/")] = funcs
     return out
 
 
+@functools.lru_cache(maxsize=None)
+def cbmc_version():
+    r = subprocess.run(["cbmc", "--version"], capture_output=True, text=True, errors="replace")
+    return r.stdout.strip()
+
+
 def _cache_path(cache_dir, source, flags):
     st = os.stat(source)
-    key = json.dumps([str(source), st.st_mtime_ns, st.st_size, flags])
+    key = json.dumps([str(source), st.st_mtime_ns, st.st_size, flags, cbmc_version()])
     return pathlib.Path(cache_dir) / (hashlib.sha256(key.encode()).hexdigest() + ".json")
 
 
 def _process(job, root, cache_dir):
+    """Analyse one unit; never raises. Only successful results are cached."""
     source, flags, cwd = job
-    cache = _cache_path(cache_dir, source, flags) if cache_dir else None
-    if cache is not None and cache.exists():
-        try:
-            return json.loads(cache.read_text())
-        except ValueError:
-            pass
     try:
+        cache = _cache_path(cache_dir, source, flags) if cache_dir else None
+        if cache is not None and cache.exists():
+            try:
+                return json.loads(cache.read_text())
+            except ValueError:
+                pass
         result = {"raw": relativise(analyse_unit(source, flags, cwd), root)}
+        if cache is not None:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(result))
+        return result
     except subprocess.TimeoutExpired:
-        result = {"error": f"timeout after {TIMEOUT}s"}
-    except (RuntimeError, ValueError, KeyError, OSError) as exc:
-        result = {"error": f"{type(exc).__name__}: {exc}"[:200]}
-    if cache is not None:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps(result))
-    return result
+        return {"error": f"timeout after {TIMEOUT}s"}
+    except Exception as exc:  # one bad file must not abort the run
+        return {"error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
 def _run_jobs(jobs, root, scope, cache_dir, workers):
@@ -221,7 +229,7 @@ def _run_jobs(jobs, root, scope, cache_dir, workers):
             res = fut.result()
             key = os.path.relpath(source, root).replace(os.sep, "/")
             if "error" in res:
-                inv.errors[key] = res["error"]
+                inv.errors.setdefault(key, res["error"])
                 continue
             inv.merge({p: f for p, f in res["raw"].items() if not scope.excludes(p)})
     return inv
@@ -235,14 +243,15 @@ def build(compile_db, scope, jobs=None, cache_dir=OUT / "cache", root=ROOT):
     for entry in db:
         cwd = entry["directory"]
         source = os.path.normpath(os.path.join(cwd, entry["file"]))
-        if source in seen:
+        flags = entry_flags(entry)
+        if (source, tuple(flags), cwd) in seen:
             continue
-        seen.add(source)
+        seen.add((source, tuple(flags), cwd))
         rel = os.path.relpath(source, root).replace(os.sep, "/")
         if scope.excludes(rel):
             excluded.add(rel)
         else:
-            todo.append((source, entry_flags(entry), cwd))
+            todo.append((source, flags, cwd))
     inv = _run_jobs(todo, root, scope, cache_dir, jobs)
     inv.excluded = sorted(excluded)
     return inv
@@ -262,13 +271,23 @@ def main(argv=None):
     ap.add_argument("--db", type=pathlib.Path, default=ROOT / "build/proofs/compile_commands.json")
     ap.add_argument("--scope", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parent / "scope.toml")
     ap.add_argument("--jobs", type=int, default=None, help="parallel workers (default: cpu count)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore and do not write the cache (needed after header edits)")
+    ap.add_argument("--allow-errors", action="store_true",
+                    help="exit 0 even if some files could not be analysed")
     args = ap.parse_args(argv)
-    inv = build(args.db, args.scope, jobs=args.jobs)
+    inv = build(args.db, args.scope, jobs=args.jobs,
+                cache_dir=None if args.no_cache else OUT / "cache")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(inv.to_json(), indent=1) + "\n")
-    print(json.dumps(inv.totals()))
+    t = inv.totals()
+    print(json.dumps(t))
     for path, why in sorted(inv.errors.items()):
         print(f"error: {path}: {why}", file=sys.stderr)
+    if inv.errors:
+        print(f"WARNING: {t['errors']} file(s) are NOT in these totals "
+              "(size unknown); see \"errors\" in the JSON.", file=sys.stderr)
+        return 0 if args.allow_errors else 1
     return 0
 
 
