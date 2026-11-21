@@ -8,7 +8,9 @@ contracts = []
 disable_checks = []
 disable_reason = ""
 
+# offset: mutated line minus the function's first line (as CBMC locates it).
 # Mutants that change nothing a caller can observe (callers guarantee m >= n).
 [[equivalent_mutants]]
+offset = 10
 diff = "for (; carry && i < m; ++i) { ==> for (; carry && i != m; ++i) {"
 reason = "i enters this loop equal to n <= m and grows by 1, so it reaches m before it can pass it; i < m and i != m agree on every iteration"

@@ -137,7 +137,7 @@ class RunFixtureTest(unittest.TestCase):
             r = run.run_harness(FIX / "loop_harness_ok", out=pathlib.Path(tmp) / "out",
                                 include_first=[tmp])
         self.assertEqual(r.status, "fail", r.detail)
-        self.assertEqual(r.input_hash, run.input_hash(FIX / "loop_harness_ok"))
+        self.assertEqual(r.input_hash, "")        # not a run of the recorded inputs
 
     def test_disable_checks_outside_list_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

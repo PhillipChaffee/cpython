@@ -73,8 +73,10 @@ A harness is a directory `harnesses/<source>/<function>/` with two files:
   # Audit only (see "Audit"):
   # havoc_callees = ["name"]        # body-less callees the proof may reach
   # havoc_reason = "..."            # required with havoc_callees
+  # harness_stubs = ["name"]        # functions defined in harness.c that the target reaches
+  # harness_stubs_reason = "..."    # required with harness_stubs
   # mutants_max = 30                # mutants run for T2/T3
-  # [[equivalent_mutants]]          # diff = "...", reason = "..."
+  # [[equivalent_mutants]]          # offset = N, diff = "...", reason = "..."
   ```
 
 `python3 Tools/proofs/new_harness.py <source> <function>` creates a T1 skeleton.
@@ -93,26 +95,32 @@ The runner refuses a compile database older than `build/proofs/pyconfig.h` or
 per harness, whether a passing proof can be trusted and which tier it has earned.
 It writes `Tools/proofs/out/<harness>/audit.json` with `ok`, `audited_tier`,
 `problems`, `stubs`, `assumes` (the text of every `__CPROVER_assume`, with its
-file and line), `mutants_total`, `mutants_killed` and `input_hash`, prints one
+file and line), `mutants_total`, `mutants_killed`, `mutants_vacuous`,
+`mutants_error` and `input_hash`, prints one
 line per harness and exits 1 if any harness is not `ok`. When `ok` is false the
 harness counts for nothing. When `ok` is true, `audited_tier` is the declared
 tier, or T1 if rule 4 or 5 is not met; such a demotion is listed in `problems`
 but is not a failure.
 
-The audit is bound to its inputs. `run.input_hash()` hashes harness.c,
-proof.toml, the source file and the listed models and contracts. The audit
-reuses `result.json` only if its `input_hash` matches the current files;
-otherwise it runs the harness again first. Files that the harness `#include`s
-other than the source (for example `Python/pyctype.c`) are not in the hash.
+The audit is bound to its inputs. `run.input_hash()` hashes proof.toml and
+every file inside the repository that goto-cc reads for the harness, as
+`goto-cc -M` with the run's flags reports them. That includes harness.c, the
+source, every included file such as `Python/pyctype.c`, the headers and
+`build/proofs/pyconfig.h`, and the listed models and contracts. It also hashes
+the exact goto-cc and cbmc argument lists and `cbmc --version`. System headers
+outside the repository are not hashed. The audit reuses `result.json` only if
+its `input_hash` matches; otherwise it runs the harness again first.
 
 1. **Checks.** The property run used `--unwinding-assertions`, an `--unwind`
    bound (below T3) and every check of the fixed list, except checks disabled
    with a non-empty `disable_reason`. The audit reads the flags the run recorded
    in `result.json` (`cbmc_flags`).
 2. **Not vacuous.** The end of `harness()` must be reachable (the runner's
-   guard), and so must every `__CPROVER_assert` in harness.c. The audit checks
-   the second with `cbmc --cover assertion`: an assertion goal that cannot be
-   satisfied is an assertion that no input reaches.
+   guard), and so must every assertion located in harness.c, however it is
+   written (directly, through a macro, or in a helper function). The audit
+   checks the second with `cbmc --cover assertion`: an assertion goal that
+   cannot be satisfied is an assertion that no input reaches. As a cross-check,
+   each literal `__CPROVER_assert(` line must have a goal.
 3. **Stubs.** Every file under `models/` or `contracts/` that is compiled in
    (found from the goto binary's symbol table) must be listed in proof.toml.
    Every function that the proof reaches but that has no body, even after CBMC
@@ -124,8 +132,12 @@ other than the source (for example `Python/pyctype.c`) are not in the hash.
    each body-less function an `assert(false)` body (`goto-instrument
    --generate-function-body ... assert-false`) and asks `cbmc --cover assertion`
    which of those assertions can be reached. So a call on an infeasible path does
-   not count. `stubs` lists `models/<name>.c`, `contracts/<name>.c` and
-   `havoc:<name>`.
+   not count. A function defined in harness.c (other than `harness()`) that the
+   target function can call, directly or through other functions, is a stub
+   too. It must be listed in `harness_stubs`, with a `harness_stubs_reason`.
+   Helpers that only `harness()` calls are not stubs. `stubs` lists
+   `models/<name>.c`, `contracts/<name>.c`, `havoc:<name>` and
+   `harness:<name>`.
 4. **Mutation (T2; T3 once contract mode exists).** universalmutator (`mutate --noCheck --lines`)
    mutates only the target function's lines, as CBMC's source locations give
    them. Each mutant is a full copy of the source file in a temporary tree with
@@ -134,12 +146,18 @@ other than the source (for example `Python/pyctype.c`) are not in the hash.
    rejects are discarded. At most `mutants_max` (default 30) are run, chosen in a
    fixed-seed shuffled order, in parallel. Each run is limited to 3 times the
    baseline proof time (at least 10 s) per goto-cc or cbmc call. A mutant is
-   killed when its proof fails. One that passes, times out or errors is not
-   killed. It demotes the harness to T1 unless proof.toml lists it as equivalent:
+   killed only when one of its properties fails. A mutant whose proof is
+   vacuous (for example, it calls `abort()` on every input), errors or times
+   out is not killed. It is counted in `mutants_vacuous` or `mutants_error`
+   and always demotes the harness. A mutant whose proof passes demotes the
+   harness to T1 unless proof.toml lists it as equivalent, with the offset
+   and diff printed in its problem:
 
    ```toml
+   # from "surviving mutant (line 83, offset 9): if (len == 0) ==> if (len <= 0)"
    [[equivalent_mutants]]
-   diff = "if (len == 0) ==> if (len <= 0)"   # as printed after "surviving mutant (line N): "
+   offset = 9                          # mutated line minus the function's first code line
+   diff = "if (len == 0) ==> if (len <= 0)"
    reason = "len >= 0, so len <= 0 is len == 0"
    ```
 

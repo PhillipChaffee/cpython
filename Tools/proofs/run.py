@@ -223,24 +223,58 @@ def _harness_end_reached(goals, harness_c, cwd):
     return status == "satisfied"
 
 
-def input_hash(hdir):
-    """sha256 over harness.c, proof.toml, the source file and every listed model
-    and contract, each prefixed by its repo-relative path.
+GOTO_PLACEHOLDER = "harness.goto"
+
+
+def _dependencies(cmd, cwd):
+    """Every file the preprocessor reads for the translation units of ``cmd``
+    (``goto-cc -M`` with the same flags), as real paths."""
+    dep = [a for a in cmd if a not in ("-o", GOTO_PLACEHOLDER)]
+    dep.insert(1, "-M")
+    r = subprocess.run(dep, cwd=cwd, capture_output=True, text=True, errors="replace",
+                       timeout=TIMEOUT)
+    if r.returncode != 0:
+        err = [l for l in r.stderr.splitlines() if "error" in l.lower()] or r.stderr.splitlines()
+        raise HarnessError("goto-cc -M failed: " + (err[0].strip() if err else f"exit {r.returncode}")[:300])
+    words = r.stdout.replace("\\\n", " ").split()
+    return {os.path.realpath(os.path.join(cwd, w)) for w in words if not w.endswith(":")}
+
+
+def input_hash(hdir, *, compile_db=None):
+    """sha256 binding a run or audit to everything that determines its outcome.
+
+    It covers, each file prefixed by its repo-relative path: proof.toml, every
+    file inside the repository that goto-cc reads for the harness (harness.c,
+    the source, every included file, listed models and contracts, as reported
+    by ``goto-cc -M`` with the run's flags); the exact goto-cc arguments; the
+    exact cbmc arguments of the property and cover runs; and ``cbmc --version``.
 
     Raises HarnessError when proof.toml is invalid or a file is missing.
     """
     hdir = pathlib.Path(hdir).resolve()
     cfg = _read_config(hdir)
-    files = [hdir / "harness.c", hdir / "proof.toml", ROOT / cfg["source"], *_stub_sources(cfg)]
+    cmd, cwd, _ = goto_cc_command(hdir, cfg, GOTO_PLACEHOLDER, compile_db)
+    root = os.path.realpath(ROOT) + os.sep
+    files = {os.path.realpath(p) for p in
+             (hdir / "harness.c", hdir / "proof.toml", ROOT / cfg["source"], *_stub_sources(cfg))}
+    files |= {f for f in _dependencies(cmd, cwd) if f.startswith(root)}
     h = hashlib.sha256()
-    for path in files:
+
+    def put(label, data):
+        h.update(b"%d:%s\0%d:" % (len(label), label, len(data)))
+        h.update(data)
+
+    for path in sorted(files):
         try:
             data = pathlib.Path(path).read_bytes()
         except OSError as exc:
             raise HarnessError(f"{path} not readable: {exc.strerror}") from None
-        rel = os.path.relpath(os.path.realpath(path), ROOT).encode()
-        h.update(b"%d:%s\0%d:" % (len(rel), rel, len(data)))
-        h.update(data)
+        put(os.path.relpath(path, ROOT).encode(), data)
+    base = cbmc_base(GOTO_PLACEHOLDER, cfg)
+    put(b"goto-cc", json.dumps([*cmd, cwd]).encode())
+    put(b"cbmc", json.dumps([[*base, *checks(cfg), "--json-ui"],
+                             [*base, "--cover", "location", "--json-ui"]]).encode())
+    put(b"cbmc --version", inventory.cbmc_version().encode())
     return h.hexdigest()
 
 
@@ -271,12 +305,8 @@ def _count_assumes(paths):
     return sum(p.read_text(errors="replace").count("__CPROVER_assume") for p in paths)
 
 
-def compile_harness(hdir, cfg, goto, compile_db=None, include_first=(), timeout=TIMEOUT):
-    """goto-cc harness.c and its listed models/contracts into ``goto``.
-
-    Returns (cwd, root): the directory cbmc must run in (paths in its output
-    are relative to it) and the directory covered lines are reported against.
-    """
+def goto_cc_command(hdir, cfg, goto, compile_db=None, include_first=()):
+    """(goto-cc command, cwd, root) that compiles the harness into ``goto``."""
     harness_c = hdir / "harness.c"
     stubs = _stub_sources(cfg)
     source = (ROOT / cfg["source"]).resolve()
@@ -292,12 +322,28 @@ def compile_harness(hdir, cfg, goto, compile_db=None, include_first=(), timeout=
     flags = [*(f"-I{d}" for d in include_first), *flags,
              f"-I{ROOT}", f"-I{MODELS}", f"-I{CONTRACTS}", f"-I{source.parent}"]
     cmd = ["goto-cc", *flags, str(harness_c), *map(str, stubs), "-o", str(goto)]
+    return cmd, cwd, root
+
+
+def compile_harness(hdir, cfg, goto, compile_db=None, include_first=(), timeout=TIMEOUT):
+    """goto-cc harness.c and its listed models/contracts into ``goto``.
+
+    Returns (cwd, root): the directory cbmc must run in (paths in its output
+    are relative to it) and the directory covered lines are reported against.
+    """
+    cmd, cwd, root = goto_cc_command(hdir, cfg, goto, compile_db, include_first)
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                        errors="replace", timeout=timeout)
     if r.returncode != 0:
         err = [l for l in r.stderr.splitlines() if "error" in l.lower()] or r.stderr.splitlines()
         raise HarnessError("goto-cc failed: " + (err[0].strip() if err else f"exit {r.returncode}")[:300])
     return cwd, root
+
+
+def checks(cfg):
+    """The fixed check list minus the checks proof.toml disables."""
+    disabled = set(cfg.get("disable_checks", []))
+    return [c for c in CHECKS if c not in disabled]
 
 
 def cbmc_base(goto, cfg):
@@ -318,17 +364,18 @@ def _run(hdir, result, compile_db, include_first=(), timeout=TIMEOUT):
     _check_assertions(harness_c, cfg["tier"])
     model_srcs = [MODELS / f"{n}.c" for n in cfg.get("models", [])]
     result.assumes = _count_assumes([harness_c, *model_srcs])
-    result.input_hash = input_hash(hdir)
 
     with tempfile.TemporaryDirectory() as tmp:
         goto = os.path.join(tmp, "harness.goto")
         cwd, root = compile_harness(hdir, cfg, goto, compile_db, include_first, timeout)
+        # A run against substituted sources (include_first) is not a run of the
+        # harness's recorded inputs, so it carries no input hash.
+        if not include_first:
+            result.input_hash = input_hash(hdir, compile_db=compile_db)
 
         base = cbmc_base(goto, cfg)
-        disabled = set(cfg.get("disable_checks", []))
-        checks = [c for c in CHECKS if c not in disabled]
-        result.cbmc_flags = [*base[4:], *checks]
-        code, msgs = _cbmc_json([*base, *checks, "--json-ui"], cwd, timeout)
+        result.cbmc_flags = [*base[4:], *checks(cfg)]
+        code, msgs = _cbmc_json([*base, *checks(cfg), "--json-ui"], cwd, timeout)
         props = _section(msgs, "result")
         failed = [p for p in props if p.get("status") != "SUCCESS"]
         if code == 10 or failed:

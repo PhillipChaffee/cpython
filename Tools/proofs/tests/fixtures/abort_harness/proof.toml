@@ -1,0 +1,9 @@
+source = "Tools/proofs/tests/fixtures/abort.c"
+function = "check_nonneg"
+tier = "T2"
+unwind = 1
+max_size = 4
+models = []
+contracts = []
+disable_checks = []
+disable_reason = ""

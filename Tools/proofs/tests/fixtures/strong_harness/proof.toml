@@ -8,16 +8,20 @@ contracts = []
 disable_checks = []
 disable_reason = ""
 
+# offset 1 is line 4 (the function's code starts at line 3).
 # For int s, s < 1 and s <= 0 are the same test, and they add only s == 0,
 # where "s = 0" leaves s unchanged.
 [[equivalent_mutants]]
+offset = 1
 diff = "if (s < 0) ==> if (s <= 0)"
 reason = "s == 0 is clamped to 0, which it already is"
 
 [[equivalent_mutants]]
+offset = 1
 diff = "if (s < 0) ==> if (s < 1)"
 reason = "for int s, s < 1 is s <= 0; s == 0 is clamped to 0, which it already is"
 
 [[equivalent_mutants]]
+offset = 1
 diff = "if (s < 0) ==> if (s < (0+1))"
 reason = "same as s < 1"

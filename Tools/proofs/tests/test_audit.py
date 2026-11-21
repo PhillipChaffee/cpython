@@ -116,7 +116,66 @@ class AuditFixtureTest(unittest.TestCase):
         v = audit.audit(FIX / "unreachable_assert_harness")
         self.assertFalse(v.ok)
         self.assertEqual([p for p in v.problems if "unreachable" in p],
-                         ["harness.c:12: __CPROVER_assert is unreachable (vacuous)"])
+                         ["harness.c:12: assertion is unreachable (vacuous): dead code: n <= 4"])
+
+    def test_macro_wrapped_unreachable_assertion_is_rejected(self):
+        v = audit.audit(FIX / "macro_assert_harness")
+        self.assertFalse(v.ok)
+        self.assertEqual([p for p in v.problems if "unreachable" in p],
+                         ["harness.c:15: assertion is unreachable (vacuous): s == 12345"])
+
+    def test_harness_defined_callee_is_an_unlisted_stub(self):
+        v = audit.audit(FIX / "callback_harness")
+        self.assertFalse(v.ok)
+        text = " ".join(v.problems)
+        self.assertIn("provider", text)
+        self.assertNotIn("helper", text)            # called by harness(), not by the target
+        listed = lambda t: t + 'harness_stubs = ["provider"]\nharness_stubs_reason = "test"\n'
+        v = self.audit_copy(FIX / "callback_harness", edit_toml=listed)
+        self.assertTrue(v.ok, v.problems)
+        self.assertEqual(v.stubs, ["harness:provider"])
+        v = self.audit_copy(FIX / "callback_harness",
+                            edit_toml=lambda t: t + 'harness_stubs = ["provider"]\n')
+        self.assertFalse(v.ok)
+        self.assertIn("harness_stubs_reason", " ".join(v.problems))
+
+    def test_vacuous_mutants_are_not_killed(self):
+        # Mutants such as "if (v >= 0)" abort() on every input: the proof then
+        # "fails" only as vacuous, which must not count as a kill.
+        v = audit.audit(FIX / "abort_harness")
+        self.assertTrue(v.ok, v.problems)
+        self.assertGreater(v.mutants_vacuous, 0)
+        self.assertLessEqual(v.mutants_killed + v.mutants_vacuous, v.mutants_total)
+        self.assertEqual(v.audited_tier, "T1")
+        self.assertIn("vacuous mutant, not killed", " ".join(v.problems))
+
+    def test_equivalent_mutant_needs_matching_offset(self):
+        v = self.audit_copy(FIX / "strong_harness", edit_toml=lambda t: t.replace("offset = 1", "offset = 2"))
+        self.assertEqual(v.audited_tier, "T1")
+        self.assertIn("surviving mutant (line 4, offset 1): if (s < 0) ==> if (s <= 0)",
+                      v.problems)
+
+    def test_equivalent_entry_does_not_excuse_errored_mutant(self):
+        real = run.run_harness
+
+        def fake(hdir, out=run.OUT, compile_db=None, include_first=(), timeout=run.TIMEOUT):
+            r = real(hdir, out, compile_db, include_first, timeout)
+            if include_first:                    # every mutant run "times out"
+                r.status, r.detail = "error", f"timeout after {timeout}s"
+            return r
+        with unittest.mock.patch.object(run, "run_harness", fake):
+            v = self.audit_copy(FIX / "strong_harness")
+        self.assertEqual(v.audited_tier, "T1")
+        self.assertEqual((v.mutants_killed, v.mutants_error), (0, v.mutants_total))
+        self.assertIn("timeout, not killed (line 4, offset 1): if (s < 0) ==> if (s <= 0)",
+                      " ".join(v.problems))
+
+    def test_classify(self):
+        R = run.Result
+        self.assertEqual(audit.classify(R("fail", "T2", detail="1 failed: x")), "killed")
+        self.assertEqual(audit.classify(R("fail", "T2", detail="vacuous: the end ...")), "vacuous")
+        self.assertEqual(audit.classify(R("error", "T2", detail="timeout after 3s")), "error")
+        self.assertEqual(audit.classify(R("pass", "T2")), "pass")
 
     def test_bodyless_callee_is_rejected_unless_acknowledged(self):
         v = audit.audit(FIX / "bodyless_harness")
@@ -142,6 +201,28 @@ class AuditFixtureTest(unittest.TestCase):
 
 
 class InputHashTest(unittest.TestCase):
+    def test_included_file_flags_and_version_change_input_hash(self):
+        # The copy must live inside the repository for its header to be hashed;
+        # out/ is ignored by git.
+        run.OUT.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=run.OUT) as tmp:
+            h = _copy(FIX / "loop_harness_ok", tmp,
+                      edit_c=lambda c: '#include "extra.h"\n' + c)
+            (h / "extra.h").write_text("#define EXTRA 1\n")
+            before = run.input_hash(h)
+            (h / "extra.h").write_text("#define EXTRA 2\n")
+            self.assertNotEqual(run.input_hash(h), before)
+            base = run.input_hash(h)
+            src = str((ROOT / "Tools/proofs/tests/fixtures/loop.c").resolve())
+            db = {src: {"directory": str(ROOT), "file": src,
+                        "arguments": ["cc", "-DFOO=1", "-c", src]}}
+            self.assertNotEqual(run.input_hash(h, compile_db=db), base)
+            with unittest.mock.patch.object(run.inventory, "cbmc_version", lambda: "cbmc 0.0"):
+                self.assertNotEqual(run.input_hash(h), base)
+            toml = (h / "proof.toml").read_text().replace("unwind = 5", "unwind = 6")
+            (h / "proof.toml").write_text(toml)
+            self.assertNotEqual(run.input_hash(h), base)
+
     def test_editing_harness_changes_input_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
             h = _copy(FIX / "loop_harness_ok", tmp)
