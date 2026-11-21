@@ -14,6 +14,7 @@ failure, 2 usage or input error.
 import argparse
 import dataclasses
 import json
+import math
 import pathlib
 import sys
 import tomllib
@@ -42,6 +43,8 @@ class HarnessRecord:
     audited: bool = False           # an audit.json exists
     audit_ok: bool = True           # audit.json "ok"
     covered: dict = dataclasses.field(default_factory=dict)
+    target: tuple = None            # (source, function) from proof.toml
+    invalid: str = ""               # why it cannot count: "stale", "harness deleted"
 
 
 def _zero():
@@ -73,11 +76,21 @@ class Report:
     def to_json(self):
         d = dataclasses.asdict(self)
         del d["line_tier"]
+        d["upper_bound"] = bool(self.not_in_denominator)
+        for r in (1, 2, 3):
+            d[f"pct_t{r}"] = pct_floor(getattr(self, f"t{r}"), self.total_lines)
         return d
+
+
+def pct_floor(n, total):
+    """Percentage rounded DOWN to two decimals (99.996 is 99.99, never 100.00)."""
+    return (n * 10000 // total) / 100 if total else 0.0
 
 
 def _tier_of(rec, include_unaudited):
     """The tier this record counts at, or None, plus the reason when None."""
+    if rec.invalid:
+        return None, rec.invalid
     if rec.status != "pass":
         return None, f"status {rec.status}"
     if rec.audited:
@@ -105,13 +118,21 @@ def merge(inv, records, include_unaudited=False):
             rep.skipped[rec.harness] = why
             continue
         rep.harnesses_counted += 1
+        # T2/T3 credit is for the target function only: a postcondition on f
+        # says nothing about the correctness of its callees.
+        tsrc, tfunc = rec.target or (None, None)
+        tfn = files.get(tsrc, {}).get("functions", {}).get(tfunc)
+        target_lines = set(tfn["lines"]) if tfn else set()
         for path, lines in rec.covered.items():
             lt = line_tier.get(path)
             if lt is None:
                 continue
             for line in lines:
-                if line in lt and lt[line] < RANK[tier]:
-                    lt[line] = RANK[tier]
+                rank = RANK[tier]
+                if rank > 1 and not (path == tsrc and line in target_lines):
+                    rank = 1
+                if line in lt and lt[line] < rank:
+                    lt[line] = rank
     rep.line_tier = line_tier
 
     for path, f in sorted(files.items()):
@@ -144,39 +165,73 @@ def merge(inv, records, include_unaudited=False):
     return rep
 
 
-def load_records(out):
-    """Read every ``<harness>/result.json`` (+ ``audit.json``) below ``out``."""
+def _target(hdir):
+    try:
+        with open(hdir / "proof.toml", "rb") as fh:
+            cfg = tomllib.load(fh)
+        return (cfg["source"], cfg["function"])
+    except (OSError, tomllib.TOMLDecodeError, KeyError):
+        return None
+
+
+def load_records(out, harness_root=run.HARNESSES, hash_fn=None):
+    """Read every ``<harness>/result.json`` (+ ``audit.json``) below ``out``.
+
+    A record is marked invalid ("harness deleted") when its directory no longer
+    exists below ``harness_root``, or ("stale") when the input hash of the
+    result or of the audit differs from ``hash_fn`` of the harness now.
+    """
     out = pathlib.Path(out)
+    hash_fn = hash_fn or run.input_hash
     records = []
     for rpath in sorted(out.rglob("result.json")):
         rel = rpath.parent.relative_to(out)
         if rel.parts and rel.parts[0] in SKIP_DIRS:
             continue
+        hdir = pathlib.Path(harness_root) / rel
         try:
-            res = run.Result(**json.loads(rpath.read_text()))
+            raw = json.loads(rpath.read_text())
+            res = run.Result(**raw)
         except (ValueError, TypeError) as exc:
-            records.append(HarnessRecord(str(rel), "error", "", covered={}))
+            records.append(HarnessRecord(str(rel), "error", "", invalid="unreadable result.json"))
             print(f"warning: unreadable {rpath}: {exc}", file=sys.stderr)
             continue
         rec = HarnessRecord(str(rel), res.status, res.tier, covered=res.covered)
+        if not (hdir / "proof.toml").exists():
+            rec.invalid = "harness deleted"
+            records.append(rec)
+            continue
+        rec.target = _target(hdir)
         apath = rpath.parent / "audit.json"
+        audit_hash = None
         if apath.exists():
+            rec.audited = True
             try:
                 audit = json.loads(apath.read_text())
-                rec.audited = True
-                rec.audit_ok = audit.get("ok") is True
-                rec.audited_tier = audit.get("audited_tier")
             except ValueError:
-                rec.audited, rec.audit_ok = True, False
+                audit = None
+            if isinstance(audit, dict) and audit.get("audited_tier") in RANK:
+                rec.audit_ok = audit.get("ok") is True
+                rec.audited_tier = audit["audited_tier"]
+                audit_hash = audit.get("input_hash")
+            else:
+                rec.audit_ok = False
+        try:
+            now = hash_fn(hdir)
+        except Exception:                # HarnessError and friends: cannot verify
+            now = None
+        if now is None or res.input_hash != now or (rec.audited and audit_hash != now):
+            rec.invalid = "stale"
         records.append(rec)
     return records
 
 
-def build_report(out=OUT, include_unaudited=False, inventory_path=None):
+def build_report(out=OUT, include_unaudited=False, inventory_path=None,
+                 harness_root=run.HARNESSES):
     out = pathlib.Path(out)
     ipath = pathlib.Path(inventory_path) if inventory_path else out / "inventory.json"
     inv = json.loads(ipath.read_text())
-    return merge(inv, load_records(out), include_unaudited)
+    return merge(inv, load_records(out, harness_root), include_unaudited)
 
 
 def load_reasons(path=REASONS):
@@ -218,7 +273,8 @@ def render_unreached(rep, reasons=None):
         elif val not in REASON_CODES:
             raise ValueError(f"reasons: {key}: unknown reason {val!r}; "
                              f"allowed: {', '.join(REASON_CODES)}")
-    out = ["# Unreached code", ""]
+    out = ["PROVISIONAL — unaudited figures", ""] if rep.provisional else []
+    out += ["# Unreached code", ""]
     if rep.not_in_denominator:
         out += [f"## Files not in the denominator ({len(rep.not_in_denominator)})", "",
                 "The inventory could not analyse these files: size unknown, uncovered.", ""]
@@ -240,7 +296,7 @@ def render_lcov(rep, tier, root=ROOT):
     rank = RANK[tier]
     out = []
     for path, lt in rep.line_tier.items():
-        out += ["TN:", f"SF:{pathlib.Path(root) / path}"]
+        out += ["TN:provisional_unaudited" if rep.provisional else "TN:", f"SF:{pathlib.Path(root) / path}"]
         out += [f"DA:{l},{int(lt[l] >= rank)}" for l in sorted(lt)]
         out += [f"LF:{len(lt)}", f"LH:{sum(1 for v in lt.values() if v >= rank)}",
                 "end_of_record"]
@@ -248,7 +304,10 @@ def render_lcov(rep, tier, root=ROOT):
 
 
 def _pct(n, total):
-    return f"{100 * n / total:.2f}%" if total else "n/a"
+    if not total:
+        return "n/a"
+    v = n * 10000 // total
+    return f"{v // 100}.{v % 100:02d}%"
 
 
 def render_summary(rep):
@@ -260,6 +319,9 @@ def render_summary(rep):
     for r in (1, 2, 3):
         lines.append(f"T{r} lines covered: {getattr(rep, f't{r}')} "
                      f"({_pct(getattr(rep, f't{r}'), rep.total_lines)})")
+    if rep.not_in_denominator:
+        lines.append(f"percentages are upper bounds: {len(rep.not_in_denominator)} "
+                     "file(s) not in denominator")
     lines.append(f"functions total: {rep.functions_total}")
     for r in (1, 2, 3):
         lines.append(f"T{r} functions: {getattr(rep, f'functions_t{r}')} fully or partly covered, "
@@ -302,6 +364,8 @@ def main(argv=None, report=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", type=pathlib.Path, default=OUT, help="directory holding the artifacts")
     ap.add_argument("--inventory", type=pathlib.Path, help="default: <out>/inventory.json")
+    ap.add_argument("--harnesses", type=pathlib.Path, default=run.HARNESSES,
+                    help="directory holding the harness sources (default: Tools/proofs/harnesses)")
     ap.add_argument("--reasons", type=pathlib.Path, default=REASONS)
     ap.add_argument("--fail-under-t1", type=float, metavar="PCT",
                     help="exit 1 if T1 line coverage is below PCT percent")
@@ -314,17 +378,24 @@ def main(argv=None, report=None):
     gated = args.fail_under_t1 is not None or args.baseline is not None
     if args.include_unaudited and gated:
         ap.error("--include-unaudited cannot be combined with --fail-under-t1 or --baseline")
+    if args.file and gated:
+        ap.error("--file cannot be combined with --fail-under-t1 or --baseline")
+    if args.fail_under_t1 is not None and not (
+            math.isfinite(args.fail_under_t1) and 0 <= args.fail_under_t1 <= 100):
+        ap.error("--fail-under-t1 must be a number from 0 to 100")
 
     try:
         baseline = None
         if args.baseline:
             baseline = json.loads(args.baseline.read_text())
-            if not all(isinstance(baseline.get(k), int) for k in ("t1", "t2", "t3")):
-                raise ValueError(f"{args.baseline}: needs integer t1, t2, t3")
+            if not isinstance(baseline, dict) or not all(
+                    type(baseline.get(k)) is int and baseline[k] >= 0 for k in ("t1", "t2", "t3")):
+                raise ValueError(f"{args.baseline}: must be an object with "
+                                 "non-negative integer t1, t2, t3")
         reasons = load_reasons(args.reasons)
         rep = report
         if rep is None:
-            rep = build_report(args.out, args.include_unaudited, args.inventory)
+            rep = build_report(args.out, args.include_unaudited, args.inventory, args.harnesses)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -341,12 +412,16 @@ def main(argv=None, report=None):
     print(render_summary(rep), end="")
 
     rc = 0
-    if args.fail_under_t1 is not None and rep.total_lines:
-        pct = 100 * rep.t1 / rep.total_lines
-        if pct < args.fail_under_t1:
-            print(f"FAIL: T1 coverage {pct:.2f}% is below {args.fail_under_t1}%", file=sys.stderr)
+    if args.fail_under_t1 is not None:
+        if not rep.total_lines:
+            print("error: empty denominator: no inventory lines, cannot check --fail-under-t1",
+                  file=sys.stderr)
+            return 2
+        if 100 * rep.t1 < args.fail_under_t1 * rep.total_lines:
+            print(f"FAIL: T1 coverage {_pct(rep.t1, rep.total_lines)} is below "
+                  f"{args.fail_under_t1}%", file=sys.stderr)
             rc = 1
-    if baseline:
+    if baseline is not None:
         for t in ("t1", "t2", "t3"):
             if getattr(rep, t) < baseline[t]:
                 print(f"FAIL: {t.upper()} covers {getattr(rep, t)} lines, baseline {baseline[t]}",

@@ -168,16 +168,27 @@ genhtml Tools/proofs/out/proof-coverage-t1.info -o Tools/proofs/out/html   # wor
   that counts is `audited_tier` from `audit.json`, not the tier declared in
   `proof.toml`: a harness that declares T2 but whose audit finds no real
   postcondition counts at T1.
-- **What counts.** Only a harness with status `pass`, an `audit.json` and audit
-  `ok: true`. Anything else contributes nothing and is listed as skipped, with the
-  reason, in the summary. Covered lines outside the inventory are ignored. A line
-  is one distinct (file, line) pair even when the inventory lists it in two
-  functions, so `total_lines` can be a little below the inventory's per-function sum.
+- **What counts.** Only a harness with status `pass`, an `audit.json` with
+  `ok: true` and a valid `audited_tier`, whose harness directory still exists and
+  whose `input_hash` in `result.json` and in `audit.json` both equal
+  `run.input_hash()` of the harness now. Anything else contributes nothing and is
+  listed as skipped, with the reason (`stale`, `harness deleted`, `not audited`,
+  `audit failed`, `status fail`), in the summary. Covered lines outside the
+  inventory are ignored. A line is one distinct (file, line) pair even when the
+  inventory lists it in two functions, so `total_lines` can be a little below the
+  inventory's per-function sum.
+- **T2/T3 credit is for the target function only.** The target is the `source`
+  and `function` in the harness's `proof.toml`. Every other line the harness
+  covers counts at T1 only, because a postcondition on `f` says nothing about the
+  correctness of its callees.
+- **Percentages round down** to two decimals (99.996 prints as 99.99%), so a
+  percentage never shows 100.00% unless every line is covered.
 - **Functions.** A function counts for a tier when at least one of its lines is
   covered at that tier; the summary also gives the number with every line covered.
 - **Not in the denominator.** Files the inventory could not analyse (its
   `"errors"`) have unknown size and are not in `total_lines`, so every percentage is
-  an upper bound on true coverage. The summary prints their count,
+  an upper bound on true coverage. The summary prints "percentages are upper
+  bounds" with their count, the JSON has `"upper_bound": true`,
   `proof-coverage.json` lists them under `not_in_denominator`, and `unreached.md`
   starts with them as "size unknown, uncovered".
 - **`unreached.md`** lists every function with no covered line as
@@ -188,11 +199,14 @@ genhtml Tools/proofs/out/proof-coverage-t1.info -o Tools/proofs/out/html   # wor
   `inline-asm`, `solver-timeout`, `needs-contract`. Other codes are an error.
 - **Gates.** `--fail-under-t1 PCT` and `--baseline FILE` (`{"t1": n, "t2": n,
   "t3": n}` covered-line counts; no tier may drop below it) exit 1 on failure.
-  Exit 2 is a usage or input error.
+  Exit 2 is a usage or input error, including an empty denominator with
+  `--fail-under-t1`, a PCT outside 0 to 100 and `--file` with a gate.
 - **`--include-unaudited` is provisional.** Until `audit.json` exists, every
   harness counts for nothing. This flag counts passing, unaudited harnesses at T1
   only (never higher, whatever they declare) and prints that the figures are
-  provisional and unaudited. It cannot be combined with `--fail-under-t1` or
+  provisional and unaudited. The files it writes are marked: lcov records use
+  `TN:provisional_unaudited` and `unreached.md` starts with "PROVISIONAL —
+  unaudited figures". Stale and deleted harnesses are still excluded. It cannot be combined with `--fail-under-t1` or
   `--baseline`.
 - **`--file PATH`** prints one file's functions with covered/total lines and
   tier, least covered first.
