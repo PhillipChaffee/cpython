@@ -1,0 +1,9 @@
+source = "Python/mystrtoul.c"
+function = "PyOS_strtoul"
+tier = "T1"
+unwind = 14
+max_size = 12
+models = []
+contracts = []
+disable_checks = []
+disable_reason = ""

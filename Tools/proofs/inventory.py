@@ -174,7 +174,7 @@ def analyse_unit(source, flags, cwd):
             for p, fs in raw.items()}
 
 
-def _relativise(raw, root):
+def relativise(raw, root):
     """Repo-relative paths; drop system headers and the build directory."""
     out = {}
     root = os.path.realpath(root)
@@ -201,7 +201,7 @@ def _process(job, root, cache_dir):
         except ValueError:
             pass
     try:
-        result = {"raw": _relativise(analyse_unit(source, flags, cwd), root)}
+        result = {"raw": relativise(analyse_unit(source, flags, cwd), root)}
     except subprocess.TimeoutExpired:
         result = {"error": f"timeout after {TIMEOUT}s"}
     except (RuntimeError, ValueError, KeyError, OSError) as exc:

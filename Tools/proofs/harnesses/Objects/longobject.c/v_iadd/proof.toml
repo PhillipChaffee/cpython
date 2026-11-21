@@ -1,0 +1,9 @@
+source = "Objects/longobject.c"
+function = "v_iadd"
+tier = "T2"
+unwind = 9
+max_size = 8
+models = []
+contracts = []
+disable_checks = []
+disable_reason = ""

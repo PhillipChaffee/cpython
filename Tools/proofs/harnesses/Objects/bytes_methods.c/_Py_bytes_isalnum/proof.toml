@@ -1,0 +1,9 @@
+source = "Objects/bytes_methods.c"
+function = "_Py_bytes_isalnum"
+tier = "T2"
+unwind = 9
+max_size = 8
+models = []
+contracts = []
+disable_checks = []
+disable_reason = ""
