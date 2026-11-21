@@ -1,0 +1,14 @@
+source = "Objects/longobject.c"
+function = "v_isub"
+tier = "T2"
+unwind = 4
+max_size = 3
+object_bits = 10
+models = []
+contracts = ["longobject"]
+enforce_contract = "v_isub"
+disable_checks = ["--unsigned-overflow-check"]
+disable_reason = "the borrow is computed with unsigned digit arithmetic modulo 2**32 on purpose (the source comment says so); unsigned wraparound is defined C behaviour"
+# Contract mode costs about 5.5 minutes per run at 3 digits (pilot-report.md),
+# so the mutation gate samples 8 mutants, not 30.
+mutants_max = 8

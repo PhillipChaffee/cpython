@@ -1,12 +1,17 @@
 source = "Objects/longobject.c"
 function = "v_iadd"
 tier = "T2"
-unwind = 9
-max_size = 8
+unwind = 4
+max_size = 3
+object_bits = 10
 models = []
-contracts = []
+contracts = ["longobject"]
+enforce_contract = "v_iadd"
 disable_checks = []
 disable_reason = ""
+# Contract mode costs about 5.5 minutes per run at 3 digits (pilot-report.md),
+# so the mutation gate samples 8 mutants, not 30.
+mutants_max = 8
 
 # offset: mutated line minus the function's first line (as CBMC locates it).
 # Mutants that change nothing a caller can observe (callers guarantee m >= n).

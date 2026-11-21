@@ -9,10 +9,15 @@
  * The arrays hold exactly m and n digits, so any read past them is a bounds
  * failure.  Postcondition (T2): x holds the low m digits of x0 + y0, the
  * returned carry is the carry out of the top digit, and y is unchanged.
+ *
+ * The run also enforces v_iadd's contract in contracts/longobject.h
+ * (enforce_contract): its requires are assumed, its ensures and assigns
+ * checked, so callers' harnesses may replace v_iadd by it.
  */
 #include "Objects/longobject.c"
+#include "Tools/proofs/contracts/longobject.h"
 
-#define MAXN 8
+#define MAXN LONGOBJECT_CONTRACT_MAX_DIGITS
 
 void harness(void)
 {
@@ -21,6 +26,8 @@ void harness(void)
     __CPROVER_assume(m <= MAXN);            /* proof bound */
     digit *x = malloc(m * sizeof(digit));
     digit *y = malloc(n * sizeof(digit));
+    /* The callers' arrays exist: the harness's own allocations may not fail. */
+    __CPROVER_assume(x != NULL && y != NULL);
     for (Py_ssize_t i = 0; i < m; i++) {
         __CPROVER_assume(x[i] <= PyLong_MASK);  /* PyLong digit invariant */
     }
@@ -30,6 +37,7 @@ void harness(void)
 
     digit *x0 = malloc(m * sizeof(digit));
     digit *y0 = malloc(n * sizeof(digit));
+    __CPROVER_assume(x0 != NULL && y0 != NULL);     /* the reference's copies */
     for (Py_ssize_t i = 0; i < m; i++) {
         x0[i] = x[i];
     }

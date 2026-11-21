@@ -1,0 +1,8 @@
+source = "Objects/longobject.c"
+function = "add_then_sub"
+tier = "T1"
+unwind = 4
+max_size = 3
+object_bits = 10
+contracts = ["longobject"]
+replace_contracts = ["v_iadd", "v_isub"]
